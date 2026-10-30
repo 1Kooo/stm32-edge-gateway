@@ -334,9 +334,9 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>USE_HAL_DRIVER,STM32F407xx</Define>
+              <Define>USE_HAL_DRIVER,STM32F407xx,APP_CONFIG_LOCAL</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Libraries\CMSIS;.\Libraries\STM32F4xx_HAL_Driver\Inc;.\User;.\Public;.\APP\led;.\APP\beep;.\APP\key;.\APP\exti;.\APP\time;.\APP\pwm;.\APP\iwdg;.\APP\wwdg;.\APP\input;.\APP\touch_key;.\APP\rng;.\APP\wkup;.\APP\adc;.\APP\adc_temp;.\APP\dac;.\APP\pwm_dac;.\APP\dma;.\APP\rtc;.\APP\iic;.\APP\24Cxx;.\APP\ds18b20;.\APP\hwjs;.\APP\rs485;.\APP\can;.\APP\tftlcd;.\APP\flash;.\APP\spi;.\APP\stm32_flash;.\APP\touch;.\app;.\bsp;.\common</IncludePath>
+              <IncludePath>.\Libraries\CMSIS;.\Libraries\STM32F4xx_HAL_Driver\Inc;.\User;.\Public;.\APP\led;.\APP\beep;.\APP\key;.\APP\exti;.\APP\time;.\APP\pwm;.\APP\iwdg;.\APP\wwdg;.\APP\input;.\APP\touch_key;.\APP\rng;.\APP\wkup;.\APP\adc;.\APP\adc_temp;.\APP\dac;.\APP\pwm_dac;.\APP\dma;.\APP\rtc;.\APP\iic;.\APP\24Cxx;.\APP\ds18b20;.\APP\hwjs;.\APP\rs485;.\APP\can;.\APP\tftlcd;.\APP\flash;.\APP\spi;.\APP\stm32_flash;.\APP\touch;.\app;.\bsp;.\common;.\drv;.\Middlewares\FreeRTOS;.\Middlewares\FreeRTOS\Source\include;.\Middlewares\FreeRTOS\Source\portable\RVDS\ARM_CM4F;.\port</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -378,12 +378,162 @@
       </TargetOption>
       <Groups>
         <Group>
+          <GroupName>port</GroupName>
+          <Files>
+            <File>
+              <FileName>net_if_esp01s.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\port\net_if_esp01s.c</FilePath>
+            </File>
+            <File>
+              <FileName>net_if.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\port\net_if.h</FilePath>
+            </File>
+            <File>
+              <FileName>mqtt_client.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\port\mqtt_client.c</FilePath>
+            </File>
+            <File>
+              <FileName>mqtt_client.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\port\mqtt_client.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>FreeRTOS</GroupName>
+          <Files>
+            <File>
+              <FileName>tasks.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\tasks.c</FilePath>
+            </File>
+            <File>
+              <FileName>queue.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\queue.c</FilePath>
+            </File>
+            <File>
+              <FileName>list.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\list.c</FilePath>
+            </File>
+            <File>
+              <FileName>timers.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\timers.c</FilePath>
+            </File>
+            <File>
+              <FileName>event_groups.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\event_groups.c</FilePath>
+            </File>
+            <File>
+              <FileName>heap_4.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\portable\MemMang\heap_4.c</FilePath>
+            </File>
+            <File>
+              <FileName>port.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Middlewares\FreeRTOS\Source\portable\RVDS\ARM_CM4F\port.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>bsp</GroupName>
+          <Files>
+            <File>
+              <FileName>bsp_pinmap.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\bsp\bsp_pinmap.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>common</GroupName>
+          <Files>
+            <File>
+              <FileName>ringbuf.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\common\ringbuf.c</FilePath>
+            </File>
+            <File>
+              <FileName>ringbuf.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\common\ringbuf.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>drv</GroupName>
+          <Files>
+            <File>
+              <FileName>drv_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\drv_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_uart.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\drv_uart.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_spiflash.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\drv_spiflash.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_spiflash.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\drv_spiflash.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_dht11.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\drv_dht11.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_dht11.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\drv_dht11.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_adc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\drv_adc.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_adc.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\drv_adc.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
           <GroupName>app</GroupName>
           <Files>
             <File>
               <FileName>app_main.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\app\app_main.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_freertos.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_freertos.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_config.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_config_local.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_config_local.h</FilePath>
             </File>
           </Files>
         </Group>

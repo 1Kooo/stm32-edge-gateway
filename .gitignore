@@ -18,3 +18,9 @@ DebugConfig/
 # ---- misc ----
 JLinkLog.txt
 *.log
+
+# 本地真实凭据，永不提交
+app_config_local.h
+
+# 本地修复日志，仅自己看，不入库
+修复日志/

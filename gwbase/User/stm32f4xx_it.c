@@ -38,6 +38,12 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f4xx_it.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* Defined in port.c. This port does not declare it in a header, and without
+ * the FreeRTOSConfig.h mapping the compiler needs the prototype here. */
+void xPortSysTickHandler(void);
 
 /** @addtogroup STM32F4xx_HAL_Examples
   * @{
@@ -125,9 +131,11 @@ void UsageFault_Handler(void)
   * @param  None
   * @retval None
   */
+#if 0  /* provided by FreeRTOS port.c */
 void SVC_Handler(void)
 {
 }
+#endif
 
 /**
   * @brief  This function handles Debug Monitor exception.
@@ -143,18 +151,32 @@ void DebugMon_Handler(void)
   * @param  None
   * @retval None
   */
+#if 0  /* provided by FreeRTOS port.c */
 void PendSV_Handler(void)
 {
 }
+#endif
 
 /**
   * @brief  This function handles SysTick Handler.
   * @param  None
   * @retval None
   */
+/**
+  * @brief  SysTick handler shared by HAL and FreeRTOS.
+  *
+  * HAL_Init() enables the tick interrupt long before the scheduler runs.
+  * Forwarding to xPortSysTickHandler at that stage would dereference a NULL
+  * pxCurrentTCB, so the tick is only handed over once the scheduler is up.
+  */
 void SysTick_Handler(void)
 {
   HAL_IncTick();
+
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+    xPortSysTickHandler();
+  }
 }
 
 /******************************************************************************/
