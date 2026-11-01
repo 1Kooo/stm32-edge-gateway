@@ -44,8 +44,8 @@ int main(void)
     LED_Init();
     TFTLCD_Init();                  /* FSMC LCD, 3.5" ILI9488              */
     KEY_Init();
-    TP_Init();                      /* XPT2046, calibrates on first run    */
-    LCD_Display_Dir(0);             /* 0 = portrait 320x480                */
+    LCD_Display_Dir(1);             /* 1 = landscape 480x320               */
+    TP_Init();                      /* XPT2046；置于设方向之后，校准才在横屏坐标系下进行 */
 
     app_main();                     /* never returns: starts the scheduler */
 }

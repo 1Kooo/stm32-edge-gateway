@@ -28,6 +28,9 @@
 #include "net_if.h"
 #include "mqtt_client.h"
 #include "app_config.h"
+#include "lv_port.h"
+#include "key.h"
+#include "touch.h"          /* 触摸坐标调试显示用：tp_dev */
 
 /* ================= 断言与内核钩子 ================= */
 void app_assert_failed(const char *file, int line)
@@ -199,7 +202,7 @@ TaskHandle_t storage_task_handle;
 /* ================= UI 任务 ================= */
 // 唯一碰 LCD 的任务，其他任务只写内存，避免总线竞争
 void ui_task(void *args);
-#define UI_TASK_STACK_SIZE   768
+#define UI_TASK_STACK_SIZE   2048
 #define UI_TASK_PRIORITY     0
 #define UI_TASK_PERIOD       500
 TaskHandle_t ui_task_handle;
@@ -320,8 +323,9 @@ void uart_poll_task(void *args)
 
 /* ================= 网络：AT -> TCP -> MQTT ================= */
 #define MQTT_PUB_PERIOD_MS   2000u      /* 正常节奏：和采样同速，稳态不积压 */
-#define MQTT_CATCHUP_MS      200u       /* 补传节奏：积压时快追 */
-#define MQTT_CATCHUP_MAX     10u        /* 一轮最多补几条 */
+#define MQTT_CATCHUP_MS      200u       /* 补传节奏：轮与轮之间的间隔 */
+#define MQTT_CATCHUP_GAP_MS  200u       /* 一轮内每条之间的间隔 */
+#define MQTT_CATCHUP_MAX     5u         /* 一轮最多补几条；一轮约 1 秒 */
 #define MQTT_BACKLOG_MARK    5u         /* 待发超过这个数就进补传模式 */
 #define MQTT_KEEPALIVE_S     30u        /* 告诉 broker 的心跳周期 */
 #define MQTT_PING_IDLE_MS    10000u     /* 空闲这么久就发一次 PINGREQ */
@@ -460,10 +464,23 @@ void net_task(void *args)
 
                     if (backlog <= MQTT_BACKLOG_MARK) {
                         app_log("[mqtt] -> %s\r\n", payload);        /* 正常节奏逐条打 */
-                    } else if ((sent % 10u) == 0u || sent == budget) {
-                        app_log("[mqtt] catch-up %lu/%lu\r\n",        /* 补传按批汇总，防刷屏 */
-                                (unsigned long)sent, (unsigned long)backlog);
                     }
+
+                    /* 补传不能连发。实测连发约 26 条/秒，会把 ESP-01S 的串口缓冲
+                     * 和 TCP 发送队列灌满，导致 AT 应答挤不进来、心跳 1 秒内收不到
+                     * PINGRESP，30 秒后误判链路已死（日志表现：catch-up 刷屏后
+                     * 突然 ping FAIL -3 三连）。
+                     * 每条间隔 200ms 约 5 条/秒，比稳态快 10 倍，追得动又不噎住。 */
+                    if (sent < budget) {
+                        vTaskDelay(pdMS_TO_TICKS(MQTT_CATCHUP_GAP_MS));
+                    }
+                }
+
+                /* 一轮结束汇总一行。放在循环外，中途追上写指针提前收尾时
+                 * 也能看出这轮实际补了几条（原来只有凑满整轮才打印）。 */
+                if (backlog > MQTT_BACKLOG_MARK && sent > 0) {
+                    app_log("[mqtt] catch-up %lu/%lu\r\n",
+                            (unsigned long)sent, (unsigned long)backlog);
                 }
             }
 
@@ -474,7 +491,7 @@ void net_task(void *args)
             if ((HAL_GetTick() - last_ping) >= MQTT_PING_IDLE_MS) {
                 last_ping = HAL_GetTick();
 
-                r = mqtt_ping();            /* 发 PINGREQ + 等 PINGRESP，最多 1 秒 */
+                r = mqtt_ping();            /* 发 PINGREQ + 等 PINGRESP，最多 2 秒 */
                 if (r == 0) {
                     ping_fail = 0;          /* 真收到应答，链路确认活着 */
                 } else {
@@ -631,19 +648,32 @@ static uint32_t log_pending(void)
  * 途中会把"已标记但指针没来得及前进"的记录跳过（掉电时才会出现）。 */
 static int log_peek_next(log_entry_t *e, uint32_t *addr)
 {
-    int rc = -1;
+    int      rc = -1;
+    uint32_t end;
 
-    if (!s_log_ready) return -1;
+    if (!s_log_ready) {
+        return -1;
+    }
 
-    if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+    if (s_flash_mutex) {
+        xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+    }
 
-    while (s_log_rptr + SENSOR_RECORD_SIZE <= s_log_wptr) {
-        if (drv_flash_read(s_log_rptr, (uint8_t *)e, sizeof(*e)) != 0) break;
-        if (e->magic != LOG_MAGIC || e->rsv != LOG_FMT_VER) break;  /* 空位/旧格式 */
+    /* 先把写指针存一份：循环里只读它，避免中途被别的任务改掉导致判断错位 */
+    end = s_log_wptr;
 
-        if (e->state == LOG_ST_SENT) {                    /* 已发，跳过 */
+    while (s_log_rptr + SENSOR_RECORD_SIZE <= end) {
+        if (drv_flash_read(s_log_rptr, (uint8_t *)e, sizeof(*e)) != 0) {
+            break;                  /* Flash 读失败，指针不动，下次再试 */
+        }
+
+        if (e->magic != LOG_MAGIC || e->rsv != LOG_FMT_VER) {
+            break;                  /* 空位或旧格式，说明后面还没写数据 */
+        }
+
+        if (e->state == LOG_ST_SENT) {
             s_log_rptr += SENSOR_RECORD_SIZE;
-            continue;
+            continue;               /* 这条已经发过，跳过继续找 */
         }
 
         *addr = s_log_rptr;
@@ -651,7 +681,10 @@ static int log_peek_next(log_entry_t *e, uint32_t *addr)
         break;
     }
 
-    if (s_flash_mutex) xSemaphoreGive(s_flash_mutex);
+    if (s_flash_mutex) {
+        xSemaphoreGive(s_flash_mutex);
+    }
+
     return rc;
 }
 
@@ -769,89 +802,397 @@ void sample_task(void *args)
     }
 }
 
-/* ================= UI 实现 ================= */
-static void ui_draw_static(void)
-{
-    LCD_Clear(WHITE);
-    FRONT_COLOR = BLACK;
+/* ================= UI：LVGL 界面（横屏 480x320） ================= */
 
-    LCD_ShowString(10,  10, 300, 480, 24, (u8 *)"GW V0.3");
-    LCD_ShowString(10,  70, 300, 480, 16, (u8 *)"LIGHT");
-    LCD_ShowString(10, 170, 300, 480, 16, (u8 *)"TEMP");
-    LCD_ShowString(10, 280, 300, 480, 16, (u8 *)"------ system ------");
+/* 界面控件句柄：建一次，之后只改内容，不重建对象 */
+static lv_obj_t *s_scr_main;        /* 主界面 */
+static lv_obj_t *s_scr_wifi;        /* WiFi 信息页 */
+static uint8_t   s_on_wifi = 0;     /* 当前是否停在 WiFi 页 */
+
+static lv_obj_t *s_wifi_state;      /* WiFi 页：网络状态 */
+static lv_obj_t *s_wifi_mqtt;       /* WiFi 页：MQTT 状态 */
+
+static lv_obj_t *s_ui_temp;         /* 温度数值 */
+static lv_obj_t *s_ui_temp_bar;     /* 温度进度条 */
+static lv_obj_t *s_ui_light_pct;    /* 光照百分数 */
+static lv_obj_t *s_ui_light_bar;    /* 光照进度条 */
+static lv_obj_t *s_ui_net_text;     /* 顶栏右侧：online / offline */
+static lv_obj_t *s_ui_seq;          /* 采样序号 */
+static lv_obj_t *s_ui_sent;         /* 已上报条数 */
+static lv_obj_t *s_ui_backlog;      /* 待补传条数 */
+static lv_obj_t *s_ui_uptime;       /* 运行时间 */
+static lv_obj_t *s_ui_heap;         /* 剩余堆 */
+
+/* 触摸坐标调试显示：验证坐标变换对不对时打开，确认后改 0 就完全消失。
+ * 显示的是变换前的原始值，正好用来判断该开 SWAP / INV 哪个开关。 */
+#define UI_SHOW_TOUCH_DEBUG  1
+#if UI_SHOW_TOUCH_DEBUG
+static lv_obj_t *s_ui_touch;
+#endif
+
+/* 建一个标签：字体和颜色统一在这里设，省得每处重复写样式 */
+static lv_obj_t *ui_label(lv_obj_t *parent, int32_t x, int32_t y,
+                          const lv_font_t *font, lv_color_t color)
+{
+    lv_obj_t *lb = lv_label_create(parent);
+
+    lv_obj_set_pos(lb, x, y);
+    lv_obj_set_style_text_font(lb, font, 0);
+    lv_obj_set_style_text_color(lb, color, 0);
+
+    return lb;
 }
 
+/* 建一张白底卡片：统一边框、圆角、背景色，省得每处重复设样式 */
+static lv_obj_t *ui_card(lv_obj_t *parent, int32_t x, int32_t y,
+                         int32_t w, int32_t h)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+
+    lv_obj_set_size(card, w, h);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_style_bg_color(card, lv_color_white(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xC9D8E8), 0);
+    lv_obj_set_style_radius(card, 6, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 卡片上的滑动要能传到屏幕，否则手势判定会停在卡片这一层。
+     * lv_obj 构造时对"有父对象的对象"默认就会加 GESTURE_BUBBLE，
+     * 这里显式写一遍是为了让意图清楚，也不受库默认值变化影响。
+     * 注意用的是 GESTURE_BUBBLE，不是 EVENT_BUBBLE，两个标志不是一回事。 */
+    lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    return card;
+}
+
+/* 建主界面。之后只改文字和数值，不重建对象 */
+static void ui_build_main(lv_obj_t *scr)
+{
+    lv_obj_t *card;
+    lv_obj_t *lb;
+
+    /* 浅灰蓝底 + 白卡片，才有层次感；纯白底会糊成一片 */
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xE8EEF5), 0);
+    lv_obj_set_style_text_color(scr, lv_color_hex(0x2D3748), 0);
+
+    /* ---- 顶栏：左边标题，右边链路状态 ---- */
+    lb = ui_label(scr, 12, 10, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(lb, "GW V0.3");
+
+    s_ui_net_text = ui_label(scr, 386, 10, &lv_font_montserrat_14, lv_color_hex(0x999999));
+    lv_label_set_text(s_ui_net_text, "offline");
+
+    /* ---- 左卡片：温度 ---- */
+    card = ui_card(scr, 10, 44, 220, 140);
+
+    lb = ui_label(card, 12, 8, &lv_font_montserrat_14, lv_color_hex(0xE53E3E));
+    lv_label_set_text(lb, "TEMP");
+
+    s_ui_temp = ui_label(card, 12, 32, &lv_font_montserrat_28, lv_color_hex(0xE53E3E));
+    lv_label_set_text(s_ui_temp, "--.- C");
+
+    s_ui_temp_bar = lv_bar_create(card);
+    lv_obj_set_size(s_ui_temp_bar, 196, 12);
+    lv_obj_set_pos(s_ui_temp_bar, 12, 112);
+    lv_bar_set_range(s_ui_temp_bar, -100, 600);          /* -10.0 ~ 60.0 摄氏度 */
+    lv_bar_set_value(s_ui_temp_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_ui_temp_bar, lv_color_hex(0xE2E8F0), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_ui_temp_bar, lv_color_hex(0xE53E3E), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_ui_temp_bar, 4, 0);
+
+    /* ---- 右卡片：光照 ---- */
+    card = ui_card(scr, 250, 44, 220, 140);
+
+    lb = ui_label(card, 12, 8, &lv_font_montserrat_14, lv_color_hex(0x319795));
+    lv_label_set_text(lb, "LIGHT");
+
+    s_ui_light_pct = ui_label(card, 12, 32, &lv_font_montserrat_28, lv_color_hex(0x319795));
+    lv_label_set_text(s_ui_light_pct, "0 %");
+
+    s_ui_light_bar = lv_bar_create(card);
+    lv_obj_set_size(s_ui_light_bar, 196, 12);
+    lv_obj_set_pos(s_ui_light_bar, 12, 112);
+    lv_bar_set_range(s_ui_light_bar, 0, 100);
+    lv_bar_set_value(s_ui_light_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_ui_light_bar, lv_color_hex(0xE2E8F0), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_ui_light_bar, lv_color_hex(0x319795), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_ui_light_bar, 4, 0);
+
+    /* ---- 统计条：三列横排 ---- */
+    card = ui_card(scr, 10, 194, 460, 48);
+
+    s_ui_seq = ui_label(card, 14, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(s_ui_seq, "SEQ 0");
+
+    s_ui_sent = ui_label(card, 170, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(s_ui_sent, "SENT 0");
+
+    s_ui_backlog = ui_label(card, 330, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(s_ui_backlog, "BACK 0");
+
+    /* ---- 底栏：深色条，视觉上收口 ---- */
+    card = lv_obj_create(scr);
+    lv_obj_set_size(card, 480, 58);
+    lv_obj_set_pos(card, 0, 262);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2233), 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 0, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_ui_uptime = ui_label(card, 14, 20, &lv_font_montserrat_14, lv_color_hex(0xC9D8E8));
+    lv_label_set_text(s_ui_uptime, "UPTIME 00:00:00");
+
+    s_ui_heap = ui_label(card, 300, 20, &lv_font_montserrat_14, lv_color_hex(0xC9D8E8));
+    lv_label_set_text(s_ui_heap, "HEAP 0 B");
+
+#if UI_SHOW_TOUCH_DEBUG
+    s_ui_touch = ui_label(card, 180, 20, &lv_font_montserrat_14, lv_color_hex(0x8899BB));
+    lv_label_set_text(s_ui_touch, "T ----,----");
+#endif
+}
+
+/* WiFi 只读页：展示当前连接信息。
+ * 改 WiFi 账号要改 app_config_local.h 再重新编译，页面上不做输入。 */
+static void ui_build_wifi(lv_obj_t *scr)
+{
+    lv_obj_t *card;
+    lv_obj_t *lb;
+
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xE8EEF5), 0);
+    lv_obj_set_style_text_color(scr, lv_color_hex(0x2D3748), 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* ---- 顶栏 ---- */
+    lb = ui_label(scr, 12, 10, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(lb, "WIFI");
+
+    lb = ui_label(scr, 336, 10, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "KEY2 = back");
+
+    /* ---- 连接信息卡片 ---- */
+    card = ui_card(scr, 10, 44, 460, 190);
+
+    lb = ui_label(card, 16, 14, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "SSID");
+    lb = ui_label(card, 150, 14, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(lb, WIFI_SSID);
+
+    lb = ui_label(card, 16, 46, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "NET");
+    s_wifi_state = ui_label(card, 150, 46, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(s_wifi_state, "down");
+
+    lb = ui_label(card, 16, 78, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "MQTT");
+    s_wifi_mqtt = ui_label(card, 150, 78, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(s_wifi_mqtt, "offline");
+
+    /* 分隔线用一串短横，比 lv_line 省事 */
+    lb = ui_label(card, 16, 108, &lv_font_montserrat_14, lv_color_hex(0xD0D8E4));
+    lv_label_set_text(lb, "-------------------------------------------");
+
+    lb = ui_label(card, 16, 122, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "HOST");
+    lb = ui_label(card, 150, 122, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(lb, BEMFA_HOST);
+
+    lb = ui_label(card, 16, 154, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "TOPIC");
+    lb = ui_label(card, 150, 154, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
+    lv_label_set_text(lb, BEMFA_TOPIC);
+
+    /* ---- 提示卡片 ---- */
+    card = ui_card(scr, 10, 244, 460, 62);
+
+    lb = ui_label(card, 16, 10, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "change SSID / password in app_config_local.h");
+
+    lb = ui_label(card, 16, 34, &lv_font_montserrat_14, lv_color_hex(0x777777));
+    lv_label_set_text(lb, "then rebuild and download");
+}
+
+static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连滑 */
+
+/* 统一的切屏入口：KEY2 和触摸手势都走这里，避免两处各写一套 */
+static void ui_switch_to(uint8_t to_wifi)
+{
+    if (s_on_wifi == to_wifi) {
+        return;                                                     /* 已经在目标页 */
+    }
+    if ((xTaskGetTickCount() - s_last_sw) < pdMS_TO_TICKS(300)) {
+        return;                                                     /* 动画还没走完，忽略连滑 */
+    }
+
+    s_last_sw = xTaskGetTickCount();
+    s_on_wifi = to_wifi;
+
+    if (to_wifi) {
+        lv_screen_load_anim(s_scr_wifi, LV_SCREEN_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+    } else {
+        lv_screen_load_anim(s_scr_main, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+    }
+}
+
+/* 手势回调：两个屏幕都注册，按滑动方向切页。
+ * 方向语义是"手指往哪滑"：往左滑 = 想看右边的内容 = 进 WiFi 页。 */
+static void ui_gesture_cb(lv_event_t *e)
+{
+    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+
+    if (dir == LV_DIR_LEFT) {
+        ui_switch_to(1);
+    } else if (dir == LV_DIR_RIGHT) {
+        ui_switch_to(0);
+    }
+}
+
+/* 建两个屏幕：上电先显示主界面 */
+static void ui_create(void)
+{
+    s_scr_main = lv_obj_create(NULL);
+    s_scr_wifi = lv_obj_create(NULL);
+
+    /* 屏幕必须清掉 SCROLLABLE。lv_obj 构造时默认会给所有对象加这个标志，
+     * 而手势判定开头就是 "有对象在滚动就直接返回"，屏幕一旦可滚动，
+     * 手指在空白处划动会被当成滚动，手势永远触发不了。 */
+    lv_obj_clear_flag(s_scr_main, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_scr_wifi, LV_OBJ_FLAG_SCROLLABLE);
+
+    ui_build_main(s_scr_main);
+    ui_build_wifi(s_scr_wifi);
+
+    /* 屏幕本身也要能收手势：手指按在空白处时，命中的对象就是 screen */
+    lv_obj_add_event_cb(s_scr_main, ui_gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(s_scr_wifi, ui_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+    lv_screen_load(s_scr_main);
+}
+
+/* LVGL 每 5ms 处理一次（刷新/触摸/动画）；
+ * 数据源变化慢，每 100 次循环（约 500ms）才更新一次文字。 */
 void ui_task(void *args)
 {
     ui_snapshot_t snap;
-    char          line[40];
-    uint32_t      last_seq = 0;
-    uint8_t       tick_cnt = 0;
+    char          buf[48];
+    uint32_t      last_upd = 0;
+    uint32_t      up_s;
+    uint8_t       key_cnt = 0;
     (void)args;
 
-    ui_draw_static();
+    ui_create();
 
-    while (1)
-    {
-        vTaskDelay(pdMS_TO_TICKS(UI_TASK_PERIOD));
+    while (1) {
+        lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(5));
 
-        taskENTER_CRITICAL();
-        snap = s_latest;                /* 16 字节快照，几微秒 */
-        taskEXIT_CRITICAL();
-
-        if (snap.seq != last_seq)
-        {
-            last_seq = snap.seq;
-
-            /* 光照 */
-            sprintf(line, "%3u %%       ", (unsigned)snap.light_pct);
-            LCD_ShowString(10,  95, 300, 480, 24, (u8 *)line);
-            sprintf(line, "%4u mV     ", (unsigned)snap.light_mv);
-            LCD_ShowString(10, 130, 300, 480, 16, (u8 *)line);
-
-            /* 温度 */
-            if (snap.temp_x10 == -999)
-            {
-                sprintf(line, " --.- C     ");
+        /* 每 4 次循环（约 20ms）扫一次按键。KEY2 在主界面和 WiFi 页之间切换 */
+        if (++key_cnt >= 4u) {
+            key_cnt = 0;
+            if (KEY_Scan(0) == KEY2_PRESS) {
+                ui_switch_to((uint8_t)(!s_on_wifi));
             }
-            else
-            {
-                int16_t t    = snap.temp_x10;
-                char    sign = ' ';
-
-                if (t < 0) { sign = '-'; t = (int16_t)(-t); }
-                sprintf(line, "%c%2d.%d C    ", sign, t / 10, t % 10);
-            }
-            LCD_ShowString(10, 195, 300, 480, 24, (u8 *)line);
-            sprintf(line, "%4u mV     ", (unsigned)snap.temp_mv);
-            LCD_ShowString(10, 230, 300, 480, 16, (u8 *)line);
         }
 
-        if (++tick_cnt >= 2u)           /* 系统信息 1 秒刷一次 */
+        /* 取走移植层判出来的滑动。LVGL 自带的 gesture 偶尔也能触发，
+         * 两条路并存没关系：ui_switch_to 里已经在目标页就直接 return。 */
         {
-            tick_cnt = 0;
+            uint8_t sw = lv_port_take_swipe();
 
-            sprintf(line, "uptime %6lu s  ",
-                    (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ));
-            LCD_ShowString(10, 310, 300, 480, 16, (u8 *)line);
+            if (sw == 1u) {
+                ui_switch_to(1);            /* 往左滑 → 进 WiFi 页 */
+            } else if (sw == 2u) {
+                ui_switch_to(0);            /* 往右滑 → 回主界面 */
+            }
+        }
 
-            sprintf(line, "heap   %6u    ", (unsigned)xPortGetFreeHeapSize());
-            LCD_ShowString(10, 335, 300, 480, 16, (u8 *)line);
+        /* 按真实时间判断，不受 lv_timer_handler 耗时影响。
+         * 之前用循环次数算（100 次 × 5ms），但首帧刷全屏要几百毫秒，
+         * 100 次循环可能变成几十秒，数据迟迟不更新。 */
+        if ((xTaskGetTickCount() - last_upd) < pdMS_TO_TICKS(500)) {
+            continue;
+        }
+        last_upd = xTaskGetTickCount();
 
-            sprintf(line, "stack  %6u    ", (unsigned)uxTaskGetStackHighWaterMark(NULL));
-            LCD_ShowString(10, 360, 300, 480, 16, (u8 *)line);
+        taskENTER_CRITICAL();
+        snap = s_latest;
+        taskEXIT_CRITICAL();
 
-            sprintf(line, "wake   %6lu    ", (unsigned long)s_uart_wake);
-            LCD_ShowString(10, 385, 300, 480, 16, (u8 *)line);
+        /* 温度：数值和进度条一起更新 */
+        if (snap.temp_x10 == -999) {
+            lv_label_set_text(s_ui_temp, "--.- C");
+            lv_bar_set_value(s_ui_temp_bar, -100, LV_ANIM_OFF);
+        } else {
+            sprintf(buf, "%d.%d C", snap.temp_x10 / 10, snap.temp_x10 % 10);
+            lv_label_set_text(s_ui_temp, buf);
+            lv_bar_set_value(s_ui_temp_bar, snap.temp_x10, LV_ANIM_OFF);
+        }
 
-            /* 网络状态：down / connecting / ready */
-            sprintf(line, "NET    %s        ", net_if_state_str());
-            LCD_ShowString(10, 410, 300, 480, 16, (u8 *)line);
+        /* 光照 */
+        lv_bar_set_value(s_ui_light_bar, snap.light_pct, LV_ANIM_OFF);
+        sprintf(buf, "%u %%", (unsigned)snap.light_pct);
+        lv_label_set_text(s_ui_light_pct, buf);
 
-            /* MQTT：是否在线 + 已上报条数 */
-            sprintf(line, "MQTT   %s  %lu     ",
-                    s_mqtt_up ? "up  " : "down", (unsigned long)s_pub_cnt);
-            LCD_ShowString(10, 435, 300, 480, 16, (u8 *)line);
+        /* 采样序号 / 已上报 / 待补传 */
+        sprintf(buf, "SEQ %lu", (unsigned long)snap.seq);
+        lv_label_set_text(s_ui_seq, buf);
+
+        sprintf(buf, "SENT %lu", (unsigned long)s_pub_cnt);
+        lv_label_set_text(s_ui_sent, buf);
+
+        sprintf(buf, "BACK %lu", (unsigned long)log_pending());
+        lv_label_set_text(s_ui_backlog, buf);
+
+        /* 链路状态：有 MQTT 就绿，否则红 */
+        if (s_mqtt_up) {
+            lv_label_set_text(s_ui_net_text, "online");
+            lv_obj_set_style_text_color(s_ui_net_text, lv_color_hex(0x22AA22), 0);
+        } else {
+            lv_label_set_text(s_ui_net_text, "offline");
+            lv_obj_set_style_text_color(s_ui_net_text, lv_color_hex(0xDD3333), 0);
+        }
+
+        /* 运行时间 秒 -> 时:分:秒 */
+        up_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
+        sprintf(buf, "UPTIME %02lu:%02lu:%02lu",
+                (unsigned long)(up_s / 3600u),
+                (unsigned long)((up_s / 60u) % 60u),
+                (unsigned long)(up_s % 60u));
+        lv_label_set_text(s_ui_uptime, buf);
+
+        sprintf(buf, "HEAP %u B", (unsigned)xPortGetFreeHeapSize());
+        lv_label_set_text(s_ui_heap, buf);
+
+#if UI_SHOW_TOUCH_DEBUG
+        /* 显示变换前的原始坐标：手指点四角，看范围就知道 SWAP / INV 该怎么开 */
+        {
+            uint16_t dx;
+            uint16_t dy;
+
+            if (tp_dev.sta & TP_PRES_DOWN) {
+                dx = tp_dev.x[0];
+                dy = tp_dev.y[0];
+            } else {
+                dx = 0xFFFFu;
+                dy = 0xFFFFu;
+            }
+
+            sprintf(buf, "T %u,%u", (unsigned)dx, (unsigned)dy);
+            lv_label_set_text(s_ui_touch, buf);
+        }
+#endif
+
+        /* WiFi 页的状态一起刷新，切过去就是最新的 */
+        lv_label_set_text(s_wifi_state, net_if_state_str());
+
+        if (s_mqtt_up) {
+            lv_label_set_text(s_wifi_mqtt, "online");
+            lv_obj_set_style_text_color(s_wifi_mqtt, lv_color_hex(0x22AA22), 0);
+        } else {
+            lv_label_set_text(s_wifi_mqtt, "offline");
+            lv_obj_set_style_text_color(s_wifi_mqtt, lv_color_hex(0xDD3333), 0);
         }
     }
 }

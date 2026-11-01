@@ -20,6 +20,7 @@
 #include "tftlcd.h"
 #include "led.h"
 #include "SysTick.h"
+#include "lv_port.h"
 
 #define APP_VERSION "V0.2"
 
@@ -89,6 +90,15 @@ void app_main(void)
                    (u8 *)(rwifi ? "USART3 115200 FAIL" : "USART3 115200 ok"));
     LCD_ShowString(10, 140, tftlcd_data.width, tftlcd_data.height, 16, "485: echo");
     LCD_ShowString(10, 165, tftlcd_data.width, tftlcd_data.height, 16, "wifi: dump to uart1");
+
+    /* ---------------- LVGL 移植层自检（阶段 1） ----------------
+     * 只做 lv_init + display/indev 注册，不建任何界面、不调 lv_timer_handler，
+     * 所以屏幕不会被 LVGL 接管，现有自检画面保持不动。
+     * 目的是把 LVGL 真正链接进来，验证代码能编、能初始化、并测出真实占用。
+     * 等 ui_task 里正式启用 LVGL 后，这一句可以删掉。 */
+    lv_port_init();
+    printf("[lvgl] port init ok  v%d.%d.%d\r\n",
+           LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
 
     /* ---------------- hand over to RTOS ---------------- */
     App_freeRTOS_start();

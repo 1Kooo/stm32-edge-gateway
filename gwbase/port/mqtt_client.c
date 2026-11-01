@@ -34,9 +34,11 @@
  * 一个主题名 + 一百多字节 JSON，192 足够，静态更可预测。 */
 #define MQTT_PKT_MAX   192u
 
-/* 发 PINGREQ 后等 PINGRESP 的上限。1 秒足够本地局域网往返，
- * 又不至于把网络任务卡太久（等待期间整个 net_task 是阻塞的）。 */
-#define MQTT_PING_TIMEOUT_MS   1000u
+/* 发 PINGREQ 后等 PINGRESP 的上限。
+ * 本地局域网往返 1 秒本来够，但补传时 ESP-01S 正忙着转发报文，AT 应答
+ * 可能被压后，1 秒容易误判（日志里 -3 三连就是这么来的）。放到 2 秒留余量，
+ * 代价是判死的总时间从约 30 秒变成约 36 秒。 */
+#define MQTT_PING_TIMEOUT_MS   2000u
 
 static uint8_t  s_pkt[MQTT_PKT_MAX];
 static uint8_t  s_connected = 0;    /* 只有收到合法 CONNACK 才置 1 */
