@@ -40,4 +40,24 @@
 #define BEMFA_PORT       9501
 #endif
 
+/* OTA 升级服务器：跑在 PC 上的 ota_server.py（D:\gw\tools\）。
+ * 默认值是 Windows 移动热点的网关地址 —— PC 开了热点时，
+ * PC 自己就是 192.168.137.1，板子连这个热点后能直接访问。
+ * 换成别的网络环境时，在 app_config_local.h 里覆盖这两项即可。 */
+#ifndef OTA_HOST
+#define OTA_HOST         "192.168.137.1"
+#endif
+
+#ifndef OTA_PORT
+#define OTA_PORT         8888
+#endif
+
+/* 固件版本号：串口横幅、开机 LCD、LVGL 主页标签统一用它。
+ * 之前 app_main.c 私有 + app_freertos.c 硬编码两处 "GW V0.3"，
+ * 屏幕和串口各说各话；现在收口到这一处。
+ * 每次发版改这里（或加 build 号），OTA 验证时才能靠横幅分辨新旧。 */
+#ifndef APP_VERSION
+#define APP_VERSION      "V0.4"
+#endif
+
 #endif /* __APP_CONFIG_H */

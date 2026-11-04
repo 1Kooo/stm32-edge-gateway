@@ -254,13 +254,23 @@ int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
         s_state = NET_DOWN; return -4;
     }
 
+    /* CIPSTART 刚回 CONNECT 时，ESP 的 TCP 栈还在收尾（状态机没完全就位），
+     * 紧接着发 CIPSEND 会撞上 busy 窗口、等不到 '>'。歇 500ms 让它站稳。 */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     r = at_send_wait("AT+CIPMODE=1", "OK", 2000);
     if (r != AT_OK) {
         app_log("[net] CIPMODE=1 failed (%d)\r\n", (int)r);
         s_state = NET_DOWN; return -5;
     }
 
-    r = at_send_wait("AT+CIPSEND", ">", 3000);
+    /* CIPSEND 最多试 3 次，间隔 500ms：偶发撞上 busy 一次就放弃太脆，
+     * 重试一次通常就过了。3 次全失败才判定 socket 真的不行了。 */
+    for (i = 0; i < 3; i++) {
+        r = at_send_wait("AT+CIPSEND", ">", 3000);
+        if (r == AT_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
     if (r != AT_OK) {
         /* 1 = ESP 明确拒绝（socket 没了）；2 = 三秒内一声不响（状态卡住）。
          * 区分开才知道是"重连能好"还是"得靠 AT+RST 才能救"。 */

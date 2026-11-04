@@ -24,3 +24,9 @@ app_config_local.h
 
 # 本地修复日志，仅自己看，不入库
 修复日志/
+
+# Python 工具缓存
+__pycache__/
+
+# Keil 调试器本地配置（窗口布局/调试设置），每人不同，不入库
+*.uvoptx

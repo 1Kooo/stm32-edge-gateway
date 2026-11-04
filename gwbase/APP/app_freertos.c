@@ -27,6 +27,7 @@
 #include "data_model.h"
 #include "net_if.h"
 #include "mqtt_client.h"
+#include "app_ota.h"
 #include "app_config.h"
 #include "lv_port.h"
 #include "key.h"
@@ -360,6 +361,31 @@ void net_task(void *args)
 
     for (;;)
     {
+        /* 0. OTA 请求优先处理。
+         *
+         * OTA 要独占 USART3 那一条 TCP 链路，而 MQTT 正占着它，所以必须
+         * 先 mqtt_reset + net_if_close 让出 socket，再连 OTA 服务器。
+         * 放在循环最前面是为了保证不会在 MQTT 会话中途插进来 —— 那种时候
+         * 串口里可能还有半包 PINGRESP，会被 OTA 的握手误读。
+         *
+         * 成功时 app_ota_run 内部直接复位装新固件，走不到下面；
+         * 失败就回来当什么都没发生，重新连 MQTT 继续上报。 */
+        if (app_ota_take_request())
+        {
+            s_mqtt_up = 0;
+            mqtt_reset();
+            net_if_close();                 /* +++ 退出透传 */
+            vTaskDelay(pdMS_TO_TICKS(500));
+
+            r = app_ota_run();
+            if (r != 0) {
+                app_log("[ota] FAILED (%d), back to normal\r\n", r);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
         /* 1. 模块自检：AT / ATE0 / CWMODE=1 */
         r = net_if_init();
         if (r != 0) {
@@ -408,6 +434,15 @@ void net_task(void *args)
          *    积压少时 2 秒一条，积压多时一轮连发 10 条、间隔 200ms 追平。 */
         while (net_if_state() == NET_READY)
         {
+            /* MQTT 稳定连接时 net_task 一直待在这个内层循环里，
+             * 不回外层 for(;;)，OTA 请求就永远没人取 —— 按了 KEY1 没反应。
+             * 这里只查不取：break 走 link_down 清场，回到外层
+             * 由 take_request 真正执行（那边有完整的断链逻辑）。 */
+            if (app_ota_pending()) {
+                app_log("[ota] request seen, dropping mqtt link\r\n");
+                break;
+            }
+
             t_start = xTaskGetTickCount();      /* 用来补偿发送耗时，避免周期漂移 */
 
             backlog = log_pending();
@@ -718,6 +753,19 @@ void storage_task(void *args)
 
     while (1)
     {
+        /* OTA 正在往外部 Flash 写固件，这里必须让路。
+         *
+         * 两个任务优先级相同（都是 2），FreeRTOS 按时间片轮转，本任务随时
+         * 可能在 OTA 那一页 256 字节写到一半时被调度上来插一笔 —— SPI 总线
+         * 上两组写命令交错，固件数据就坏了，而 CRC 要到最后一刻才发现。
+         *
+         * 让路的代价是这段时间的采样数据先攒在队列里（16 条 = 32 秒），
+         * 攒满就丢。OTA 一分钟一次的事，丢几条远好过把固件写坏。 */
+        if (app_ota_busy()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         if (xQueueReceive(s_data_queue, &rec, portMAX_DELAY) != pdTRUE) {
             continue;
         }
@@ -825,7 +873,7 @@ static lv_obj_t *s_ui_heap;         /* 剩余堆 */
 
 /* 触摸坐标调试显示：验证坐标变换对不对时打开，确认后改 0 就完全消失。
  * 显示的是变换前的原始值，正好用来判断该开 SWAP / INV 哪个开关。 */
-#define UI_SHOW_TOUCH_DEBUG  1
+#define UI_SHOW_TOUCH_DEBUG  0
 #if UI_SHOW_TOUCH_DEBUG
 static lv_obj_t *s_ui_touch;
 #endif
@@ -879,7 +927,7 @@ static void ui_build_main(lv_obj_t *scr)
 
     /* ---- 顶栏：左边标题，右边链路状态 ---- */
     lb = ui_label(scr, 12, 10, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, "GW V0.3");
+    lv_label_set_text(lb, "GW " APP_VERSION);
 
     s_ui_net_text = ui_label(scr, 386, 10, &lv_font_montserrat_14, lv_color_hex(0x999999));
     lv_label_set_text(s_ui_net_text, "offline");
@@ -1088,11 +1136,22 @@ void ui_task(void *args)
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(5));
 
-        /* 每 4 次循环（约 20ms）扫一次按键。KEY2 在主界面和 WiFi 页之间切换 */
+        /* 每 4 次循环（约 20ms）扫一次按键。
+         * KEY2 = 主界面 / WiFi 页切换，KEY1 = 请求 OTA（8.2c 会换成界面按钮） */
         if (++key_cnt >= 4u) {
+            uint8_t k;
+
             key_cnt = 0;
-            if (KEY_Scan(0) == KEY2_PRESS) {
+            k = KEY_Scan(0);
+
+            if (k == KEY2_PRESS) {
                 ui_switch_to((uint8_t)(!s_on_wifi));
+            } else if (k == KEY1_PRESS) {
+                /* 这里只置标志，真正的下载在 net_task 里做。
+                 * 绝不能直接调 app_ota_run —— 那是要阻塞一两分钟的操作，
+                 * ui 任务一卡住，屏幕就冻在最后一帧，还会触发看门狗式的假死。 */
+                app_log("[ui] KEY1 -> OTA request\r\n");
+                app_ota_request();
             }
         }
 

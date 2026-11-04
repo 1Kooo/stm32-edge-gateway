@@ -18,7 +18,7 @@
           <Vendor>STMicroelectronics</Vendor>
           <PackID>Keil.STM32F4xx_DFP.2.14.0</PackID>
           <PackURL>http://www.keil.com/pack/</PackURL>
-          <Cpu>IRAM(0x20000000,0x00020000) IRAM2(0x10000000,0x00010000) IROM(0x08000000,0x00100000) CPUTYPE("Cortex-M4") FPU2 CLOCK(12000000) ELITTLE</Cpu>
+          <Cpu>IRAM(0x20000000,0x00020000) IRAM2(0x10000000,0x00010000) IROM(0x08010000,0x000F0000) CPUTYPE("Cortex-M4") FPU2 CLOCK(12000000) ELITTLE</Cpu>
           <FlashUtilSpec></FlashUtilSpec>
           <StartupFile></StartupFile>
           <FlashDriverDll>UL2CM3(-S0 -C0 -P0 -FD20000000 -FC1000 -FN1 -FF0STM32F4xx_1024 -FS08000000 -FL0100000 -FP0($$Device:STM32F407ZGTx$CMSIS\Flash\STM32F4xx_1024.FLM))</FlashDriverDll>
@@ -248,8 +248,8 @@
               </IRAM>
               <IROM>
                 <Type>1</Type>
-                <StartAddress>0x8000000</StartAddress>
-                <Size>0x100000</Size>
+                <StartAddress>0x8010000</StartAddress>
+                <Size>0xf0000</Size>
               </IROM>
               <XRAM>
                 <Type>0</Type>
@@ -358,16 +358,16 @@
             </VariousControls>
           </Aads>
           <LDads>
-            <umfTarg>1</umfTarg>
+            <umfTarg>0</umfTarg>
             <Ropi>0</Ropi>
             <Rwpi>0</Rwpi>
             <noStLib>0</noStLib>
             <RepFail>1</RepFail>
-            <useFile>0</useFile>
+            <useFile>1</useFile>
             <TextAddressRange>0x08000000</TextAddressRange>
             <DataAddressRange>0x20000000</DataAddressRange>
             <pXoBase></pXoBase>
-            <ScatterFile></ScatterFile>
+            <ScatterFile>.\gwbase.sct</ScatterFile>
             <IncludeLibs></IncludeLibs>
             <IncludeLibsPath></IncludeLibsPath>
             <Misc></Misc>
@@ -524,6 +524,26 @@
               <FileName>app_freertos.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\app\app_freertos.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_ota_flag.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_ota_flag.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_ota_flag.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_ota_flag.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_ota.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_ota.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_ota.h</FilePath>
             </File>
             <File>
               <FileName>app_config.h</FileName>

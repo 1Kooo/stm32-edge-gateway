@@ -90,7 +90,9 @@
 /*!< Uncomment the following line if you need to relocate your vector Table in
      Internal SRAM. */
 /* #define VECT_TAB_SRAM */
-#define VECT_TAB_OFFSET  0x00 /*!< Vector Table base offset field. 
+/* Bootloader 占 0x08000000~0x0800FFFF，APP 从 0x08010000 开始，
+ * 向量表必须跟着挪，否则中断全跑到 boot 的空向量里去。 */
+#define VECT_TAB_OFFSET  0x00010000 /*!< Vector Table base offset field. 
                                    This value must be a multiple of 0x200. */
 /******************************************************************************/
 
