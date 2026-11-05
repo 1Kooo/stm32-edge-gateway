@@ -29,9 +29,8 @@
 #include "mqtt_client.h"
 #include "app_ota.h"
 #include "app_config.h"
-#include "lv_port.h"
-#include "key.h"
-#include "touch.h"          /* 触摸坐标调试显示用：tp_dev */
+#include "app_ui.h"         /* ui_task 入口 + ui_snapshot_t + 显示数据 getter */
+#include "app_wifi_cfg.h"   /* 屏上配的 WiFi 凭据：待写缓冲 + 落盘 */
 
 /* ================= 断言与内核钩子 ================= */
 void app_assert_failed(const char *file, int line)
@@ -99,15 +98,9 @@ static volatile uint32_t s_pub_cnt = 0;
 #define DATA_QUEUE_LEN  16
 static QueueHandle_t s_data_queue = NULL;
 
-/* 给 ui_task 显示用的快照（临界区拷贝） */
-typedef struct {
-    uint32_t seq;
-    uint8_t  light_pct;      /* 0~100 % */
-    int16_t  temp_x10;       /* 253 = 25.3 C，-999 = 无效 */
-    uint16_t light_mv;
-    uint16_t temp_mv;
-} ui_snapshot_t;
-
+/* 给 ui_task 显示用的快照：sample_task 在临界区里更新，
+ * app_ui.c 通过 app_data_get_snapshot() 取，不直接摸这个变量。
+ * 类型定义挪到了 app_ui.h（拆文件时随 UI 一起搬走）。 */
 static ui_snapshot_t s_latest;
 
 /* 热敏电阻电路方向：
@@ -202,7 +195,7 @@ TaskHandle_t storage_task_handle;
 
 /* ================= UI 任务 ================= */
 // 唯一碰 LCD 的任务，其他任务只写内存，避免总线竞争
-void ui_task(void *args);
+// 任务实现在 app_ui.c，入口声明在 app_ui.h（拆文件时整体搬走）
 #define UI_TASK_STACK_SIZE   2048
 #define UI_TASK_PRIORITY     0
 #define UI_TASK_PERIOD       500
@@ -337,6 +330,40 @@ static uint32_t log_pending(void);
 static int      log_peek_next(log_entry_t *e, uint32_t *addr);
 static int      log_mark_sent(uint32_t addr);
 
+/* 配网相关的三个状态量，只在 net_task 里用：
+ *   UI 任务把凭据放进 wifi_cfg 的待写缓冲，内层循环发现后先搬到
+ *   s_cfg_pending，再 break 回外层落盘 —— 擦 Flash 要 100ms 上下，
+ *   不能卡在 MQTT 循环里，更不能让 LVGL 去写。 */
+static wifi_cfg_t s_cfg_pending;
+static uint8_t    s_cfg_has_pending = 0;
+static uint8_t    s_wifi_fail = 0;      /* 连续关联失败次数，到达 3 次就回退 */
+
+/* WiFi 扫描（UI 发起，net_task 执行）。
+ * 串口 AT 机只有 net_task 在开，UI 任务只能隔着这几个变量提需求，
+ * 不能自己直接发 AT —— 透传进出的时序被两个任务交叉踩了就全乱。
+ * s_scan_state 两边都写（UI 置 1 占位，net_task 置 2 出结果），
+ * 都是单字节 volatile 写，M4 上天然原子，无竞态。 */
+#define WIFI_SCAN_MAX     8u              /* 屏上一屏放得下、内存也吃得起 */
+static uint8_t       s_scan_req   = 0;    /* UI 请求标志，net_task 取走即清 */
+static volatile uint8_t s_scan_state = 0; /* 0=空闲 1=扫描中 2=结果就绪 */
+static char          s_scan_ssid[WIFI_SCAN_MAX][33];
+static int8_t        s_scan_rssi[WIFI_SCAN_MAX];
+static int           s_scan_cnt   = 0;    /* state==2 时有效，-2=AT 失败 */
+
+/* net_task 调：有请求就执行扫描（阻塞 3~6 秒）。
+ * 挂在两个位置：内层 MQTT 循环（连着时）和外层顶部（断着时）——
+ * 用户在屏上点扫描时设备往往正连着，但也可能正断线重试。 */
+static void scan_service(void)
+{
+    if (s_scan_req == 0u) return;
+    s_scan_req = 0u;
+
+    s_scan_cnt = net_if_scan(s_scan_ssid, s_scan_rssi, (int)WIFI_SCAN_MAX);
+    s_scan_state = 2u;                 /* 失败也置 2，让 UI 拿到失败码 */
+
+    app_log("[wifi] scan done: %d\r\n", s_scan_cnt);
+}
+
 void net_task(void *args)
 {
     int           r;
@@ -386,6 +413,38 @@ void net_task(void *args)
             continue;
         }
 
+        /* 0.5 配网：把新凭据落盘 + 换凭据 + 立刻重连。
+         *
+         * 两个来源都要看：
+         *   s_cfg_has_pending —— 内层循环（MQTT 已连）发现请求后搬过来的；
+         *   wifi_cfg_take_request —— 链路本来就断着时直接在这里取。
+         * 少了后一半会漏掉最关键的场景：WiFi 连不上、用户去屏上改配网，
+         * 那时候根本进不了内层循环，请求会一直躺在缓冲里没人取。
+         *
+         * 擦写 Flash 放在这个位置的原因：
+         *   1. 此时链路已经断开，不会一边发 MQTT 一边卡 100ms 擦扇区；
+         *   2. 和 storage_task 抢 SPI1 时能安心等锁；
+         *   3. 存完直接往下走就是重新 init + connect，新凭据立刻生效。 */
+        if (s_cfg_has_pending || wifi_cfg_take_request(&s_cfg_pending)) {
+            s_cfg_has_pending = 0;
+
+            if (wifi_cfg_save(&s_cfg_pending) == 0) {
+                app_log("[wifi] saved: ssid=%s\r\n", s_cfg_pending.ssid);
+            } else {
+                /* 存不进去（Flash 坏 / 锁超时）也让本次生效：
+                 * 至少这回能连上，代价是断电后又回到旧配置。 */
+                app_log("[wifi] save FAIL, apply for this run only\r\n");
+            }
+
+            net_if_set_wifi(s_cfg_pending.ssid, s_cfg_pending.pass);
+            s_wifi_fail = 0;
+            continue;                       /* 回去重新 init + 用新凭据连 */
+        }
+
+        /* 0.6 扫描选网：断着的时候也能扫 —— 用户去屏上配网，
+         * 本来就有一半场景是"现在的网连不上"。 */
+        scan_service();
+
         /* 1. 模块自检：AT / ATE0 / CWMODE=1 */
         r = net_if_init();
         if (r != 0) {
@@ -410,10 +469,31 @@ void net_task(void *args)
                 app_log("[net][raw] %s\r\n", line);
             }
 
+            /* -3 = CWJAP 关联失败。连续 3 次多半是屏上把密码打错了，
+             * 用户配过网就退回上一份配置。
+             *
+             * 为什么要自动退：设备装在现场，配错一次就永久失联，
+             * 只能拆回来接串口。让它自己退回能连的那份，代价小得多。
+             * 其它错误码（-4/-5/-6）是 TCP 层的问题，跟密码无关，不计数。 */
+            if (r == -3) {
+                s_wifi_fail++;
+                if (s_wifi_fail >= 3u && wifi_cfg_is_custom()) {
+                    s_wifi_fail = 0;
+                    if (wifi_cfg_fallback() == 0) {
+                        app_log("[wifi] 3 fails -> rollback to %s\r\n",
+                                wifi_cfg_ssid());
+                        net_if_set_wifi(wifi_cfg_ssid(), wifi_cfg_pass());
+                    }
+                }
+            } else {
+                s_wifi_fail = 0;
+            }
+
             vTaskDelay(pdMS_TO_TICKS(10000));
             continue;
         }
         app_log("[net] tcp ready\r\n");
+        s_wifi_fail = 0;                    /* 关联成功，失败计数清零 */
 
         /* 3. MQTT CONNECT：客户端 ID 用私钥，账号密码留空 */
         r = mqtt_connect(BEMFA_UID, MQTT_KEEPALIVE_S, 3000);
@@ -440,6 +520,20 @@ void net_task(void *args)
              * 由 take_request 真正执行（那边有完整的断链逻辑）。 */
             if (app_ota_pending()) {
                 app_log("[ota] request seen, dropping mqtt link\r\n");
+                break;
+            }
+
+            /* 扫描选网：退透传 + CWLAP + 回透传，MQTT 静默 3~6 秒。
+             * 心跳判死要连续 3 次 × 10 秒，一次扫描打不断链路。
+             * 若回透传失败，net_if_scan 里已把状态判 DOWN，
+             * 下面 while 条件不成立，自然走 link_down 重连。 */
+            scan_service();
+
+            /* 屏上配网：把待写凭据搬到外层去落盘。这里只搬不写 ——
+             * 擦一个扇区要 100ms 上下，留在内层会把心跳周期拖到判死。 */
+            if (wifi_cfg_take_request(&s_cfg_pending)) {
+                s_cfg_has_pending = 1;
+                app_log("[wifi] new config from UI, dropping link\r\n");
                 break;
             }
 
@@ -850,408 +944,92 @@ void sample_task(void *args)
     }
 }
 
-/* ================= UI：LVGL 界面（横屏 480x320） ================= */
+/* ================= 给 app_ui.c 的显示数据接口 =================
+ *
+ * UI 段拆去 app_ui.c 后，ui_task 不能再直接读这边的私有变量
+ * （s_latest / s_mqtt_up / s_pub_cnt / log_pending()），
+ * 统一从这四个只读 getter 走。临界区逻辑原来在 ui_task 里，
+ * 原样搬进 app_data_get_snapshot()，行为不变。 */
 
-/* 界面控件句柄：建一次，之后只改内容，不重建对象 */
-static lv_obj_t *s_scr_main;        /* 主界面 */
-static lv_obj_t *s_scr_wifi;        /* WiFi 信息页 */
-static uint8_t   s_on_wifi = 0;     /* 当前是否停在 WiFi 页 */
-
-static lv_obj_t *s_wifi_state;      /* WiFi 页：网络状态 */
-static lv_obj_t *s_wifi_mqtt;       /* WiFi 页：MQTT 状态 */
-
-static lv_obj_t *s_ui_temp;         /* 温度数值 */
-static lv_obj_t *s_ui_temp_bar;     /* 温度进度条 */
-static lv_obj_t *s_ui_light_pct;    /* 光照百分数 */
-static lv_obj_t *s_ui_light_bar;    /* 光照进度条 */
-static lv_obj_t *s_ui_net_text;     /* 顶栏右侧：online / offline */
-static lv_obj_t *s_ui_seq;          /* 采样序号 */
-static lv_obj_t *s_ui_sent;         /* 已上报条数 */
-static lv_obj_t *s_ui_backlog;      /* 待补传条数 */
-static lv_obj_t *s_ui_uptime;       /* 运行时间 */
-static lv_obj_t *s_ui_heap;         /* 剩余堆 */
-
-/* 触摸坐标调试显示：验证坐标变换对不对时打开，确认后改 0 就完全消失。
- * 显示的是变换前的原始值，正好用来判断该开 SWAP / INV 哪个开关。 */
-#define UI_SHOW_TOUCH_DEBUG  0
-#if UI_SHOW_TOUCH_DEBUG
-static lv_obj_t *s_ui_touch;
-#endif
-
-/* 建一个标签：字体和颜色统一在这里设，省得每处重复写样式 */
-static lv_obj_t *ui_label(lv_obj_t *parent, int32_t x, int32_t y,
-                          const lv_font_t *font, lv_color_t color)
+void app_data_get_snapshot(ui_snapshot_t *out)
 {
-    lv_obj_t *lb = lv_label_create(parent);
-
-    lv_obj_set_pos(lb, x, y);
-    lv_obj_set_style_text_font(lb, font, 0);
-    lv_obj_set_style_text_color(lb, color, 0);
-
-    return lb;
-}
-
-/* 建一张白底卡片：统一边框、圆角、背景色，省得每处重复设样式 */
-static lv_obj_t *ui_card(lv_obj_t *parent, int32_t x, int32_t y,
-                         int32_t w, int32_t h)
-{
-    lv_obj_t *card = lv_obj_create(parent);
-
-    lv_obj_set_size(card, w, h);
-    lv_obj_set_pos(card, x, y);
-    lv_obj_set_style_bg_color(card, lv_color_white(), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(0xC9D8E8), 0);
-    lv_obj_set_style_radius(card, 6, 0);
-    lv_obj_set_style_pad_all(card, 0, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* 卡片上的滑动要能传到屏幕，否则手势判定会停在卡片这一层。
-     * lv_obj 构造时对"有父对象的对象"默认就会加 GESTURE_BUBBLE，
-     * 这里显式写一遍是为了让意图清楚，也不受库默认值变化影响。
-     * 注意用的是 GESTURE_BUBBLE，不是 EVENT_BUBBLE，两个标志不是一回事。 */
-    lv_obj_add_flag(card, LV_OBJ_FLAG_GESTURE_BUBBLE);
-
-    return card;
-}
-
-/* 建主界面。之后只改文字和数值，不重建对象 */
-static void ui_build_main(lv_obj_t *scr)
-{
-    lv_obj_t *card;
-    lv_obj_t *lb;
-
-    /* 浅灰蓝底 + 白卡片，才有层次感；纯白底会糊成一片 */
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0xE8EEF5), 0);
-    lv_obj_set_style_text_color(scr, lv_color_hex(0x2D3748), 0);
-
-    /* ---- 顶栏：左边标题，右边链路状态 ---- */
-    lb = ui_label(scr, 12, 10, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, "GW " APP_VERSION);
-
-    s_ui_net_text = ui_label(scr, 386, 10, &lv_font_montserrat_14, lv_color_hex(0x999999));
-    lv_label_set_text(s_ui_net_text, "offline");
-
-    /* ---- 左卡片：温度 ---- */
-    card = ui_card(scr, 10, 44, 220, 140);
-
-    lb = ui_label(card, 12, 8, &lv_font_montserrat_14, lv_color_hex(0xE53E3E));
-    lv_label_set_text(lb, "TEMP");
-
-    s_ui_temp = ui_label(card, 12, 32, &lv_font_montserrat_28, lv_color_hex(0xE53E3E));
-    lv_label_set_text(s_ui_temp, "--.- C");
-
-    s_ui_temp_bar = lv_bar_create(card);
-    lv_obj_set_size(s_ui_temp_bar, 196, 12);
-    lv_obj_set_pos(s_ui_temp_bar, 12, 112);
-    lv_bar_set_range(s_ui_temp_bar, -100, 600);          /* -10.0 ~ 60.0 摄氏度 */
-    lv_bar_set_value(s_ui_temp_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(s_ui_temp_bar, lv_color_hex(0xE2E8F0), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_ui_temp_bar, lv_color_hex(0xE53E3E), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(s_ui_temp_bar, 4, 0);
-
-    /* ---- 右卡片：光照 ---- */
-    card = ui_card(scr, 250, 44, 220, 140);
-
-    lb = ui_label(card, 12, 8, &lv_font_montserrat_14, lv_color_hex(0x319795));
-    lv_label_set_text(lb, "LIGHT");
-
-    s_ui_light_pct = ui_label(card, 12, 32, &lv_font_montserrat_28, lv_color_hex(0x319795));
-    lv_label_set_text(s_ui_light_pct, "0 %");
-
-    s_ui_light_bar = lv_bar_create(card);
-    lv_obj_set_size(s_ui_light_bar, 196, 12);
-    lv_obj_set_pos(s_ui_light_bar, 12, 112);
-    lv_bar_set_range(s_ui_light_bar, 0, 100);
-    lv_bar_set_value(s_ui_light_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(s_ui_light_bar, lv_color_hex(0xE2E8F0), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_ui_light_bar, lv_color_hex(0x319795), LV_PART_INDICATOR);
-    lv_obj_set_style_radius(s_ui_light_bar, 4, 0);
-
-    /* ---- 统计条：三列横排 ---- */
-    card = ui_card(scr, 10, 194, 460, 48);
-
-    s_ui_seq = ui_label(card, 14, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(s_ui_seq, "SEQ 0");
-
-    s_ui_sent = ui_label(card, 170, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(s_ui_sent, "SENT 0");
-
-    s_ui_backlog = ui_label(card, 330, 16, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(s_ui_backlog, "BACK 0");
-
-    /* ---- 底栏：深色条，视觉上收口 ---- */
-    card = lv_obj_create(scr);
-    lv_obj_set_size(card, 480, 58);
-    lv_obj_set_pos(card, 0, 262);
-    lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2233), 0);
-    lv_obj_set_style_border_width(card, 0, 0);
-    lv_obj_set_style_radius(card, 0, 0);
-    lv_obj_set_style_pad_all(card, 0, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_ui_uptime = ui_label(card, 14, 20, &lv_font_montserrat_14, lv_color_hex(0xC9D8E8));
-    lv_label_set_text(s_ui_uptime, "UPTIME 00:00:00");
-
-    s_ui_heap = ui_label(card, 300, 20, &lv_font_montserrat_14, lv_color_hex(0xC9D8E8));
-    lv_label_set_text(s_ui_heap, "HEAP 0 B");
-
-#if UI_SHOW_TOUCH_DEBUG
-    s_ui_touch = ui_label(card, 180, 20, &lv_font_montserrat_14, lv_color_hex(0x8899BB));
-    lv_label_set_text(s_ui_touch, "T ----,----");
-#endif
-}
-
-/* WiFi 只读页：展示当前连接信息。
- * 改 WiFi 账号要改 app_config_local.h 再重新编译，页面上不做输入。 */
-static void ui_build_wifi(lv_obj_t *scr)
-{
-    lv_obj_t *card;
-    lv_obj_t *lb;
-
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0xE8EEF5), 0);
-    lv_obj_set_style_text_color(scr, lv_color_hex(0x2D3748), 0);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-
-    /* ---- 顶栏 ---- */
-    lb = ui_label(scr, 12, 10, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, "WIFI");
-
-    lb = ui_label(scr, 336, 10, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "KEY2 = back");
-
-    /* ---- 连接信息卡片 ---- */
-    card = ui_card(scr, 10, 44, 460, 190);
-
-    lb = ui_label(card, 16, 14, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "SSID");
-    lb = ui_label(card, 150, 14, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, WIFI_SSID);
-
-    lb = ui_label(card, 16, 46, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "NET");
-    s_wifi_state = ui_label(card, 150, 46, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(s_wifi_state, "down");
-
-    lb = ui_label(card, 16, 78, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "MQTT");
-    s_wifi_mqtt = ui_label(card, 150, 78, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(s_wifi_mqtt, "offline");
-
-    /* 分隔线用一串短横，比 lv_line 省事 */
-    lb = ui_label(card, 16, 108, &lv_font_montserrat_14, lv_color_hex(0xD0D8E4));
-    lv_label_set_text(lb, "-------------------------------------------");
-
-    lb = ui_label(card, 16, 122, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "HOST");
-    lb = ui_label(card, 150, 122, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, BEMFA_HOST);
-
-    lb = ui_label(card, 16, 154, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "TOPIC");
-    lb = ui_label(card, 150, 154, &lv_font_montserrat_14, lv_color_hex(0x2D3748));
-    lv_label_set_text(lb, BEMFA_TOPIC);
-
-    /* ---- 提示卡片 ---- */
-    card = ui_card(scr, 10, 244, 460, 62);
-
-    lb = ui_label(card, 16, 10, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "change SSID / password in app_config_local.h");
-
-    lb = ui_label(card, 16, 34, &lv_font_montserrat_14, lv_color_hex(0x777777));
-    lv_label_set_text(lb, "then rebuild and download");
-}
-
-static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连滑 */
-
-/* 统一的切屏入口：KEY2 和触摸手势都走这里，避免两处各写一套 */
-static void ui_switch_to(uint8_t to_wifi)
-{
-    if (s_on_wifi == to_wifi) {
-        return;                                                     /* 已经在目标页 */
+    if (out == NULL) {
+        return;
     }
-    if ((xTaskGetTickCount() - s_last_sw) < pdMS_TO_TICKS(300)) {
-        return;                                                     /* 动画还没走完，忽略连滑 */
+    taskENTER_CRITICAL();
+    *out = s_latest;
+    taskEXIT_CRITICAL();
+}
+
+uint8_t app_net_mqtt_up(void)
+{
+    return s_mqtt_up;
+}
+
+uint32_t app_net_pub_cnt(void)
+{
+    return s_pub_cnt;
+}
+
+uint32_t app_store_log_pending(void)
+{
+    return log_pending();
+}
+
+/* ================= WiFi 扫描：UI 侧接口 =================
+ * 状态机见 net_task 前面的 s_scan_* 注释。 */
+
+void app_wifi_scan_request(void)
+{
+    if (s_scan_state == 1u) return;     /* 正在扫，重复点按直接忽略 */
+    s_scan_req   = 1u;
+    s_scan_state = 1u;                  /* 先占住"扫描中"，net_task 随后执行 */
+}
+
+uint8_t app_wifi_scan_state(void)
+{
+    return s_scan_state;
+}
+
+/* 读走结果（拷贝到调用方缓冲）。只读 s_scan_state==2 的瞬间，
+ * 期间 net_task 不会再动这几个数组 —— 新扫描要先过 request，
+ * 而 request 的入口在 UI 的扫描层上，层关着就点不到。 */
+int app_wifi_scan_get(char (*out_ssid)[33], int8_t *out_rssi, int max)
+{
+    int n;
+    int i;
+
+    if (s_scan_state != 2u) return -1;
+
+    n = (s_scan_cnt < max) ? s_scan_cnt : max;
+    if (n < 0) {
+        return s_scan_cnt;              /* AT 失败码原样交给 UI 显示 */
     }
 
-    s_last_sw = xTaskGetTickCount();
-    s_on_wifi = to_wifi;
+    for (i = 0; i < n; i++) {
+        strcpy(out_ssid[i], s_scan_ssid[i]);
+        out_rssi[i] = s_scan_rssi[i];
+    }
+    return n;
+}
 
-    if (to_wifi) {
-        lv_screen_load_anim(s_scr_wifi, LV_SCREEN_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-    } else {
-        lv_screen_load_anim(s_scr_main, LV_SCREEN_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+/* ================= 外部 Flash 互斥（给别的模块用） =================
+ *
+ * s_flash_mutex 是本文件的私有变量。配网模块要擦写自己的配置区，
+ * 又必须和 storage_task 的日志写入串行，所以在这两个薄封装里拿锁，
+ * 而不是把信号量句柄暴露出去 —— 暴露句柄等于允许任何地方乱 Give。 */
+
+void app_flash_lock(void)
+{
+    if (s_flash_mutex) {
+        xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
     }
 }
 
-/* 手势回调：两个屏幕都注册，按滑动方向切页。
- * 方向语义是"手指往哪滑"：往左滑 = 想看右边的内容 = 进 WiFi 页。 */
-static void ui_gesture_cb(lv_event_t *e)
+void app_flash_unlock(void)
 {
-    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-
-    if (dir == LV_DIR_LEFT) {
-        ui_switch_to(1);
-    } else if (dir == LV_DIR_RIGHT) {
-        ui_switch_to(0);
+    if (s_flash_mutex) {
+        xSemaphoreGive(s_flash_mutex);
     }
 }
 
-/* 建两个屏幕：上电先显示主界面 */
-static void ui_create(void)
-{
-    s_scr_main = lv_obj_create(NULL);
-    s_scr_wifi = lv_obj_create(NULL);
-
-    /* 屏幕必须清掉 SCROLLABLE。lv_obj 构造时默认会给所有对象加这个标志，
-     * 而手势判定开头就是 "有对象在滚动就直接返回"，屏幕一旦可滚动，
-     * 手指在空白处划动会被当成滚动，手势永远触发不了。 */
-    lv_obj_clear_flag(s_scr_main, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(s_scr_wifi, LV_OBJ_FLAG_SCROLLABLE);
-
-    ui_build_main(s_scr_main);
-    ui_build_wifi(s_scr_wifi);
-
-    /* 屏幕本身也要能收手势：手指按在空白处时，命中的对象就是 screen */
-    lv_obj_add_event_cb(s_scr_main, ui_gesture_cb, LV_EVENT_GESTURE, NULL);
-    lv_obj_add_event_cb(s_scr_wifi, ui_gesture_cb, LV_EVENT_GESTURE, NULL);
-
-    lv_screen_load(s_scr_main);
-}
-
-/* LVGL 每 5ms 处理一次（刷新/触摸/动画）；
- * 数据源变化慢，每 100 次循环（约 500ms）才更新一次文字。 */
-void ui_task(void *args)
-{
-    ui_snapshot_t snap;
-    char          buf[48];
-    uint32_t      last_upd = 0;
-    uint32_t      up_s;
-    uint8_t       key_cnt = 0;
-    (void)args;
-
-    ui_create();
-
-    while (1) {
-        lv_timer_handler();
-        vTaskDelay(pdMS_TO_TICKS(5));
-
-        /* 每 4 次循环（约 20ms）扫一次按键。
-         * KEY2 = 主界面 / WiFi 页切换，KEY1 = 请求 OTA（8.2c 会换成界面按钮） */
-        if (++key_cnt >= 4u) {
-            uint8_t k;
-
-            key_cnt = 0;
-            k = KEY_Scan(0);
-
-            if (k == KEY2_PRESS) {
-                ui_switch_to((uint8_t)(!s_on_wifi));
-            } else if (k == KEY1_PRESS) {
-                /* 这里只置标志，真正的下载在 net_task 里做。
-                 * 绝不能直接调 app_ota_run —— 那是要阻塞一两分钟的操作，
-                 * ui 任务一卡住，屏幕就冻在最后一帧，还会触发看门狗式的假死。 */
-                app_log("[ui] KEY1 -> OTA request\r\n");
-                app_ota_request();
-            }
-        }
-
-        /* 取走移植层判出来的滑动。LVGL 自带的 gesture 偶尔也能触发，
-         * 两条路并存没关系：ui_switch_to 里已经在目标页就直接 return。 */
-        {
-            uint8_t sw = lv_port_take_swipe();
-
-            if (sw == 1u) {
-                ui_switch_to(1);            /* 往左滑 → 进 WiFi 页 */
-            } else if (sw == 2u) {
-                ui_switch_to(0);            /* 往右滑 → 回主界面 */
-            }
-        }
-
-        /* 按真实时间判断，不受 lv_timer_handler 耗时影响。
-         * 之前用循环次数算（100 次 × 5ms），但首帧刷全屏要几百毫秒，
-         * 100 次循环可能变成几十秒，数据迟迟不更新。 */
-        if ((xTaskGetTickCount() - last_upd) < pdMS_TO_TICKS(500)) {
-            continue;
-        }
-        last_upd = xTaskGetTickCount();
-
-        taskENTER_CRITICAL();
-        snap = s_latest;
-        taskEXIT_CRITICAL();
-
-        /* 温度：数值和进度条一起更新 */
-        if (snap.temp_x10 == -999) {
-            lv_label_set_text(s_ui_temp, "--.- C");
-            lv_bar_set_value(s_ui_temp_bar, -100, LV_ANIM_OFF);
-        } else {
-            sprintf(buf, "%d.%d C", snap.temp_x10 / 10, snap.temp_x10 % 10);
-            lv_label_set_text(s_ui_temp, buf);
-            lv_bar_set_value(s_ui_temp_bar, snap.temp_x10, LV_ANIM_OFF);
-        }
-
-        /* 光照 */
-        lv_bar_set_value(s_ui_light_bar, snap.light_pct, LV_ANIM_OFF);
-        sprintf(buf, "%u %%", (unsigned)snap.light_pct);
-        lv_label_set_text(s_ui_light_pct, buf);
-
-        /* 采样序号 / 已上报 / 待补传 */
-        sprintf(buf, "SEQ %lu", (unsigned long)snap.seq);
-        lv_label_set_text(s_ui_seq, buf);
-
-        sprintf(buf, "SENT %lu", (unsigned long)s_pub_cnt);
-        lv_label_set_text(s_ui_sent, buf);
-
-        sprintf(buf, "BACK %lu", (unsigned long)log_pending());
-        lv_label_set_text(s_ui_backlog, buf);
-
-        /* 链路状态：有 MQTT 就绿，否则红 */
-        if (s_mqtt_up) {
-            lv_label_set_text(s_ui_net_text, "online");
-            lv_obj_set_style_text_color(s_ui_net_text, lv_color_hex(0x22AA22), 0);
-        } else {
-            lv_label_set_text(s_ui_net_text, "offline");
-            lv_obj_set_style_text_color(s_ui_net_text, lv_color_hex(0xDD3333), 0);
-        }
-
-        /* 运行时间 秒 -> 时:分:秒 */
-        up_s = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
-        sprintf(buf, "UPTIME %02lu:%02lu:%02lu",
-                (unsigned long)(up_s / 3600u),
-                (unsigned long)((up_s / 60u) % 60u),
-                (unsigned long)(up_s % 60u));
-        lv_label_set_text(s_ui_uptime, buf);
-
-        sprintf(buf, "HEAP %u B", (unsigned)xPortGetFreeHeapSize());
-        lv_label_set_text(s_ui_heap, buf);
-
-#if UI_SHOW_TOUCH_DEBUG
-        /* 显示变换前的原始坐标：手指点四角，看范围就知道 SWAP / INV 该怎么开 */
-        {
-            uint16_t dx;
-            uint16_t dy;
-
-            if (tp_dev.sta & TP_PRES_DOWN) {
-                dx = tp_dev.x[0];
-                dy = tp_dev.y[0];
-            } else {
-                dx = 0xFFFFu;
-                dy = 0xFFFFu;
-            }
-
-            sprintf(buf, "T %u,%u", (unsigned)dx, (unsigned)dy);
-            lv_label_set_text(s_ui_touch, buf);
-        }
-#endif
-
-        /* WiFi 页的状态一起刷新，切过去就是最新的 */
-        lv_label_set_text(s_wifi_state, net_if_state_str());
-
-        if (s_mqtt_up) {
-            lv_label_set_text(s_wifi_mqtt, "online");
-            lv_obj_set_style_text_color(s_wifi_mqtt, lv_color_hex(0x22AA22), 0);
-        } else {
-            lv_label_set_text(s_wifi_mqtt, "offline");
-            lv_obj_set_style_text_color(s_wifi_mqtt, lv_color_hex(0xDD3333), 0);
-        }
-    }
-}

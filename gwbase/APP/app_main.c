@@ -22,6 +22,8 @@
 #include "SysTick.h"
 #include "lv_port.h"
 #include "app_ota_flag.h"
+#include "app_wifi_cfg.h"
+#include "net_if.h"
 #include "app_config.h"
 
 /* 外 Flash 自检第一步就是擦 0x000000 —— 那正是 OTA 固件暂存槽。
@@ -94,6 +96,15 @@ void app_main(void)
     printf("[uart] wifi   %s (usart3 115200, err=%d)\r\n", rwifi ? "FAIL" : "ok", rwifi);
     printf("[flash] init  %s  id=0x%06X\r\n",
            (rf == 0) ? "ok" : "FAIL", (unsigned)drv_flash_read_id());
+
+    /* WiFi 凭据：读外部 Flash 的配置区（用户屏上配过就用他的，没配过用宏）。
+     * 必须在起任务前做 —— 此时只有主线程在跑，不用抢 SPI1 的锁。
+     * 读出来的值同时喂给 net_if，net_task 后面直接连，不用再管凭据从哪来。
+     * 放在 report 之后是为了让开机的 `===== GW ... =====` 横幅仍是第一行，
+     * 否则 [wifi] 那行会跑到上次开机的尾巴里去，看着像串了台。 */
+    wifi_cfg_init();
+    net_if_set_wifi(wifi_cfg_ssid(), wifi_cfg_pass());
+
     drv_uart_write(UART_WIFI, (const uint8_t *)"AT\r\n", 4u, 100u);
 
 #if FLASH_SELFTEST

@@ -21,6 +21,23 @@ typedef enum {
 /* 0 on success, negative on failure. */
 int net_if_init(void);
 
+/* 换 WiFi 凭据，下一次 net_if_connect 生效。
+ *
+ * 会让下一次连接强制先 CWQAP 再重新关联：模块可能还连着旧 AP，
+ * 只改密码不改 SSID 时，光看 AT+CWJAP? 里同名 SSID 会误判成"已连接"，
+ * 新密码永远用不上。 */
+int net_if_set_wifi(const char *ssid, const char *pass);
+
+/* 扫描周围的 WiFi（AT+CWLAP）。
+ * out_ssid 每项 33 字节（32 字符 + 结尾 0），同名网络信号强度写 out_rssi。
+ * 返回条数（0 也算成功，只是周围没网）；负数 = AT 层失败。
+ * 结果按信号从强到弱排序，屏上列表把好连的排最前。
+ *
+ * 透传态调用是安全的：内部先 +++ 退透传、扫完再 CIPSEND 回透传，
+ * TCP 链路不断，MQTT 只静默几秒（心跳判死要 30 秒，扛得住）。
+ * 只有 net_task 能调 —— 串口 AT 机同一时刻只能有一个主人。 */
+int net_if_scan(char (*out_ssid)[33], int8_t *out_rssi, int max);
+
 /* Bring up WiFi and open a TCP socket. Blocking, up to timeout_ms. */
 int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms);
 

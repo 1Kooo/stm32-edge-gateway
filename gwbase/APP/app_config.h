@@ -55,9 +55,13 @@
 /* 固件版本号：串口横幅、开机 LCD、LVGL 主页标签统一用它。
  * 之前 app_main.c 私有 + app_freertos.c 硬编码两处 "GW V0.3"，
  * 屏幕和串口各说各话；现在收口到这一处。
- * 每次发版改这里（或加 build 号），OTA 验证时才能靠横幅分辨新旧。 */
+ * 每次发版改这里（或加 build 号），OTA 验证时才能靠横幅分辨新旧。
+ *
+ * V0.5 = V0.4 的回滚底座 + 屏上配网全链路（外部 Flash 双槽存储 /
+ * 断链自动换网重连 / 配错 3 次自动回退）+ 中文字库与中文界面 +
+ * 触摸 y 轴镜像修复 + UI 拆分到 app_ui.c + 扫描选网。 */
 #ifndef APP_VERSION
-#define APP_VERSION      "V0.4"
+#define APP_VERSION      "V0.5"
 #endif
 
 #endif /* __APP_CONFIG_H */

@@ -546,6 +546,31 @@
               <FilePath>.\app\app_ota.h</FilePath>
             </File>
             <File>
+              <FileName>app_ui.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_ui.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_ui.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_ui.h</FilePath>
+            </File>
+            <File>
+              <FileName>app_wifi_cfg.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_wifi_cfg.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_wifi_cfg.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_wifi_cfg.h</FilePath>
+            </File>
+            <File>
+              <FileName>lv_font_cn_14.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\lv_font_cn_14.c</FilePath>
+            </File>
+            <File>
               <FileName>app_config.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\app\app_config.h</FilePath>

@@ -69,12 +69,12 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-    #define LV_MEM_SIZE (24 * 1024U)          /**< [bytes] */   //�ڴ�������64K
+    #define LV_MEM_SIZE (48 * 1024U)          /**< [bytes] 48KB: popup draw needs more than 24KB */   //�ڴ�������64K
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0
 
-    //��lvgl �����ڴ�ռ�ŵ��ⲿSRAM�Ļ������Ը����#define LV_MEM_ADR 0   Can be in external SRAM too
+    //��lvgl �����ڴ�ռ�ŵ��ⲿSRAM�Ļ������Ը����#define LV_MEM_ADR 0   Can be in external SRAM too
     
     /** Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too. */
     #define LV_MEM_ADR 0     /**< 0: unused*/
@@ -676,7 +676,11 @@
  *  #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)
  *  @endcode
  */
-#define LV_FONT_CUSTOM_DECLARE
+/* 项目自制中文字体（APP/lv_font_cn_14.c，由 tools/make_cjk_font.py 生成）。
+ * 含 886 个汉字 + 95 个 ASCII，14px / 4bpp，位图约 82KB。
+ * 注意：它不带 FontAwesome 图标，所以不能设成 LV_FONT_DEFAULT ——
+ * 键盘上的 ✓ ← → 靠下面那个 Montserrat 提供字形。 */
+#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_cn_14)
 
 /** Always set a default font */
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
@@ -792,7 +796,7 @@
 
 #define LV_USE_IMAGEBUTTON     1
 
-#define LV_USE_KEYBOARD   0
+#define LV_USE_KEYBOARD   1   /* 配网弹层要屏上键盘（依赖 TEXTAREA/BUTTONMATRIX，均已开） */
 
 #define LV_USE_LABEL      1
 #if LV_USE_LABEL
@@ -835,7 +839,7 @@
 
 #define LV_USE_TABVIEW    0
 
-#define LV_USE_TEXTAREA   0   /**< Requires: lv_label */
+#define LV_USE_TEXTAREA   1   /**< Requires: lv_label */  /* 配网弹层输入框 */
 #if LV_USE_TEXTAREA != 0
     #define LV_TEXTAREA_DEF_PWD_SHOW_TIME 1500    /**< [ms] */
 #endif

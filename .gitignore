@@ -28,5 +28,8 @@ app_config_local.h
 # Python 工具缓存
 __pycache__/
 
+# 字体生成器的 npm 依赖（tools/make_cjk_font.py 用，谁需要谁自己装）
+tools/.fonttools/
+
 # Keil 调试器本地配置（窗口布局/调试设置），每人不同，不入库
 *.uvoptx

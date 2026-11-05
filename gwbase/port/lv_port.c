@@ -37,7 +37,9 @@
  *   左上角原始值约 319,0 或 0,479            -> 配合 INV_X / INV_Y 翻向 */
 #define TOUCH_SWAP_XY   1       /* 1 = 交换 x 与 y */
 #define TOUCH_INV_X     0       /* 1 = 左右镜像 */
-#define TOUCH_INV_Y     0       /* 1 = 上下镜像 */
+#define TOUCH_INV_Y     1       /* 1 = 上下镜像。实测按下 y_raw≈44 时报成 44，
+                                 *     但手指实际在屏幕底部（应≈275），320-44=276 正好对上，
+                                 *     所以竖屏标定的 y 方向和横屏是反的 */
 
 /* 自己判滑动，不用 LVGL 自带的手势检测。
  *
@@ -98,63 +100,96 @@ static void indev_read(lv_indev_t *indev, lv_indev_data_t *data)
     uint16_t          tx;
     uint16_t          ty;
     lv_coord_t        dx;
+    uint8_t           retry;
 
     tp_dev.scan(0);                              /* 0 = 返回屏幕坐标 */
 
-    if (tp_dev.sta & TP_PRES_DOWN) {
-        tx = tp_dev.x[0];
-        ty = tp_dev.y[0];
-
-#if TOUCH_SWAP_XY
-        {
-            uint16_t tmp = tx;
-
-            tx = ty;
-            ty = tmp;
+    /* 电阻屏按下首帧常常采样失败：XPT2046 还没稳定，TP_Read_XY2 连续几次都
+     * 判超差就放弃，TP_Scan 于是把 x[0]/y[0] 留成 0xFFFF。
+     *
+     * 这个脏值一旦送进 LVGL，会被越界钳位成屏幕右下角；而 LVGL 是在"按下那一帧"
+     * 锁定命中对象的，后面坐标变正常也不会改投，这一次点击就彻底丢了。
+     * 实测大约每三次按下就有一次，所以先重采几下把坐标拿回来。 */
+    for (retry = 0; retry < 3u; retry++) {
+        if ((tp_dev.sta & TP_PRES_DOWN) == 0) {
+            break;                               /* 没按住，不用再采 */
         }
-#endif
-#if TOUCH_INV_X
-        tx = (uint16_t)((DISP_W - 1u) - tx);
-#endif
-#if TOUCH_INV_Y
-        ty = (uint16_t)((DISP_H - 1u) - ty);
-#endif
-
-        /* 越界钳位：坐标跑到屏幕外，LVGL 找不到命中对象，手势和点击都会失效 */
-        if (tx >= DISP_W) {
-            tx = (uint16_t)(DISP_W - 1u);
+        if (tp_dev.x[0] != 0xFFFFu && tp_dev.y[0] != 0xFFFFu) {
+            break;                               /* 已经是有效坐标 */
         }
-        if (ty >= DISP_H) {
-            ty = (uint16_t)(DISP_H - 1u);
-        }
+        tp_dev.scan(0);
+    }
 
-        if (!s_was_down) {                       /* 刚按下这一帧，记起点 */
-            s_press_x = (lv_coord_t)tx;
-            s_max_dx  = 0;
+    /* ---- 这一帧没有拿到有效按下 ---- */
+    if (((tp_dev.sta & TP_PRES_DOWN) == 0) ||
+        (tp_dev.x[0] == 0xFFFFu) || (tp_dev.y[0] == 0xFFFFu)) {
+
+        /* 手指还按着，只是这帧采样没成功：沿用上次坐标继续报按下，
+         * 否则拖动会被误判成松手，滑动的起点也跟着丢。 */
+        if ((tp_dev.sta & TP_PRES_DOWN) && s_was_down) {
+            data->state = LV_INDEV_STATE_PRESSED;
+            data->point.x = last_x;
+            data->point.y = last_y;
+            return;
         }
 
-        /* 全程跟踪相对起点的最大水平位移。用峰值而不是"松手点 - 起点"，
-         * 是因为松手前如果连续几帧采样失败，坐标会停在中途，算出来的位移会偏短。 */
-        dx = (lv_coord_t)tx - s_press_x;
-        if (LV_ABS(dx) > LV_ABS(s_max_dx)) {
-            s_max_dx = dx;
-        }
-
-        s_was_down = 1;
-
-        last_x = (lv_coord_t)tx;
-        last_y = (lv_coord_t)ty;
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        if (s_was_down) {                        /* 刚松开这一帧，结算滑动 */
+        /* 真松手（或按下第一帧就没采到）：结算滑动后报释放 */
+        if (s_was_down) {
             if (LV_ABS(s_max_dx) >= SWIPE_MIN_PX) {
                 s_swipe = (s_max_dx > 0) ? 2u : 1u;
             }
             s_was_down = 0;
         }
         data->state = LV_INDEV_STATE_RELEASED;
+        data->point.x = last_x;
+        data->point.y = last_y;
+        return;
     }
 
+    /* ---- 有效按下 ---- */
+    tx = tp_dev.x[0];
+    ty = tp_dev.y[0];
+
+#if TOUCH_SWAP_XY
+    {
+        uint16_t tmp = tx;
+
+        tx = ty;
+        ty = tmp;
+    }
+#endif
+#if TOUCH_INV_X
+    tx = (uint16_t)((DISP_W - 1u) - tx);
+#endif
+#if TOUCH_INV_Y
+    ty = (uint16_t)((DISP_H - 1u) - ty);
+#endif
+
+    /* 越界钳位：坐标跑到屏幕外，LVGL 找不到命中对象，手势和点击都会失效 */
+    if (tx >= DISP_W) {
+        tx = (uint16_t)(DISP_W - 1u);
+    }
+    if (ty >= DISP_H) {
+        ty = (uint16_t)(DISP_H - 1u);
+    }
+
+    if (!s_was_down) {                           /* 刚按下这一帧，记起点 */
+        s_press_x = (lv_coord_t)tx;
+        s_max_dx  = 0;
+    }
+
+    /* 全程跟踪相对起点的最大水平位移。用峰值而不是"松手点 - 起点"，
+     * 是因为松手前如果连续几帧采样失败，坐标会停在中途，算出来的位移会偏短。 */
+    dx = (lv_coord_t)tx - s_press_x;
+    if (LV_ABS(dx) > LV_ABS(s_max_dx)) {
+        s_max_dx = dx;
+    }
+
+    s_was_down = 1;
+
+    last_x = (lv_coord_t)tx;
+    last_y = (lv_coord_t)ty;
+    data->state = LV_INDEV_STATE_PRESSED;
     data->point.x = last_x;
     data->point.y = last_y;
 }

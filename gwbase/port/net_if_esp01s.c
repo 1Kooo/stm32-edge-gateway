@@ -11,6 +11,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>     /* strtol：CWLAP 行里的信号强度用它转 */
 #include <string.h>
 
 #include "stm32f4xx_hal.h"
@@ -32,6 +33,18 @@ extern void app_log(const char *fmt, ...);
 
 static net_state_t s_state = NET_DOWN;
 static char        s_line[AT_LINE_MAX];
+
+/* 运行期 WiFi 凭据。初始值取编译期宏（app_config_local.h），
+ * 开机后由 app_main 用配置文件里的值覆盖。
+ *
+ * 放在这里而不是直接读 wifi_cfg_*：port 层不该依赖 APP 层，
+ * 以后把 ESP-01S 换成 4G 模块，这层照样能单独用。 */
+static char        s_ssid[33] = WIFI_SSID;
+static char        s_pass[65] = WIFI_PASSWORD;
+
+/* 1 = 下次连接不要走"已连同名 AP 就跳过"的捷径。
+ * 用户刚改过凭据时必须重连，否则改密码这种场景永远不生效。 */
+static uint8_t     s_force_rejoin = 0;
 
 /* ---------------------------------------------------------------- helpers */
 /* Read one line (terminated by '\n'). Returns length, or -1 on timeout. */
@@ -198,9 +211,162 @@ int net_if_init(void)
     return 0;
 }
 
+int net_if_set_wifi(const char *ssid, const char *pass)
+{
+    int changed;
+
+    if (ssid == NULL || pass == NULL || ssid[0] == '\0') {
+        return -1;
+    }
+
+    /* 先判有没有变，再覆盖。反过来的话 strcmp 永远相等，判断等于没写。 */
+    changed = (strcmp(s_ssid, ssid) != 0) || (strcmp(s_pass, pass) != 0);
+
+    strncpy(s_ssid, ssid, sizeof(s_ssid) - 1u);
+    s_ssid[sizeof(s_ssid) - 1u] = '\0';
+    strncpy(s_pass, pass, sizeof(s_pass) - 1u);
+    s_pass[sizeof(s_pass) - 1u] = '\0';
+
+    /* 只有真换了凭据才强制重连：开机时配置文件里的值和编译期宏往往一样，
+     * 白白断一次再关联要多花 5 秒，还平白多一轮重连风险。
+     *
+     * 必须置位的原因：只改密码不改 SSID 时，模块还连着那个 AP，
+     * 下面"已连同名 AP 就跳过"的捷径会让新密码永远用不上。 */
+    if (changed) {
+        s_force_rejoin = 1;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------- 扫描 */
+/* 解析一行 +CWLAP:(3,"SSID",-67,"mac",ch,enc)。
+ *
+ * ESP-AT 会把 SSID 里的 \ 和 , 转义成 \\ 和 \,（不转义的话它们会被
+ * 当成字段分隔符）。这里要还原成原始字节，否则存下来的名字和真实
+ * SSID 对不上，连接时怎么填都连不上。
+ * 返回 1 = 解析成功，0 = 这行不能用（没名字的隐藏网络等）。 */
+static int cwlap_parse(const char *line, char *ssid, uint16_t ssid_size,
+                        int8_t *rssi)
+{
+    const char *p;
+    const char *q;
+    uint16_t    i = 0;
+
+    p = strchr(line, '"');
+    if (p == NULL) return 0;
+    p++;
+
+    /* 找收尾引号。转义符 \X 算两个字节，不能停在 \ 后面那个字符上 */
+    q = p;
+    while (*q != '\0' && *q != '"') {
+        q += (*q == '\\' && q[1] != '\0') ? 2 : 1;
+    }
+    if (*q != '"') return 0;
+
+    /* 还原转义：\X -> X（\, 和 \\ 都覆盖了） */
+    while (p < q && (i + 1u) < ssid_size) {
+        if (*p == '\\' && (p + 1) < q) p++;
+        ssid[i++] = *p++;
+    }
+    ssid[i] = '\0';
+    if (i == 0u) return 0;          /* 没名字：隐藏网络，点选连不上，跳过 */
+
+    /* 信号强度在收尾引号后面第一个逗号之后，形如 ,-67 */
+    p = q + 1;
+    if (*p == ',') p++;
+    *rssi = (int8_t)strtol(p, NULL, 10);
+    return 1;
+}
+
+int net_if_scan(char (*out_ssid)[33], int8_t *out_rssi, int max)
+{
+    uint32_t t0;
+    int      n;
+    int      cnt = 0;
+    int      was_ready;
+
+    if (out_ssid == NULL || out_rssi == NULL || max <= 0) return -1;
+
+    was_ready = (s_state == NET_READY);
+
+    /* 透传中必须先退出来，否则 AT+CWLAP 会原样发进 socket 给服务器。
+     * 扫完在函数尾部重新 CIPSEND 回透传，TCP 不断。 */
+    if (was_ready) {
+        at_exit_passthrough();
+    }
+
+    drv_uart_flush(UART_WIFI);
+    drv_uart_write_str(UART_WIFI, "AT+CWLAP");
+
+    /* 扫一轮要 2 秒上下，期间没有任何输出，不能按"单行超时"判失败，
+     * 得给整体 6 秒。超时也把已收到的行交出去 —— 半份结果好过没有。 */
+    t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < 6000u) {
+        n = at_read_line(s_line, (uint16_t)sizeof(s_line), AT_REPLY_MS);
+        if (n < 0) continue;
+
+        if (strstr(s_line, "ERROR") != NULL || strstr(s_line, "FAIL") != NULL) {
+            cnt = -2;
+            break;
+        }
+        if (strncmp(s_line, "+CWLAP:", 7) == 0) {
+            if (cnt < max &&
+                cwlap_parse(s_line, out_ssid[cnt], 33u, &out_rssi[cnt]) == 1) {
+                cnt++;
+            }
+        }
+        if (strstr(s_line, "OK") != NULL) break;
+    }
+
+    /* 按信号从强到弱排序，屏上列表把最好连的排最前面。
+     * 最多 8 条，插入排序就够，不引排序函数。 */
+    if (cnt > 1) {
+        int a, b;
+
+        for (a = 1; a < cnt; a++) {
+            char    tmp[33];
+            int8_t  r = out_rssi[a];
+
+            strcpy(tmp, out_ssid[a]);
+            for (b = a - 1; b >= 0 && out_rssi[b] < r; b--) {
+                out_rssi[b + 1] = out_rssi[b];
+                strcpy(out_ssid[b + 1], out_ssid[b]);
+            }
+            out_rssi[b + 1] = r;
+            strcpy(out_ssid[b + 1], tmp);
+        }
+    }
+
+    /* 回透传。等不到 '>' 说明 socket 已经死了（扫描期间被路由器掐了等），
+     * 把状态判 DOWN，net_task 的 while(NET_READY) 自然退出走重连。 */
+    if (was_ready) {
+        if (at_send_wait("AT+CIPSEND", ">", 3000) != AT_OK) {
+            app_log("[net] re-enter passthrough FAIL, drop link\r\n");
+            s_state = NET_DOWN;
+        }
+    }
+
+    return cnt;
+}
+
+/* CWJAP 的 SSID/密码参数里 \ 和 , 必须转义，否则会被当成分隔符。
+ * 扫描列表里选出这种名字的网络时，不转义就永远连不上。 */
+static void cmd_append_escaped(char *dst, uint16_t dst_size, const char *src)
+{
+    uint16_t n = (uint16_t)strlen(dst);
+
+    while (*src != '\0' && (n + 2u) < dst_size) {
+        if (*src == '\\' || *src == ',') {
+            dst[n++] = '\\';
+        }
+        dst[n++] = *src++;
+    }
+    dst[n] = '\0';
+}
+
 int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
 {
-    char        cmd[96];
+    char        cmd[160];
     char        expect[48];
     at_result_t r;
     int         i;
@@ -215,19 +381,36 @@ int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
      *
      * 所以先查 AT+CWJAP?：回复里已经带着目标 SSID 就当已连接，跳过。
      * 既避开 ERROR，又省掉重新关联 AP 的 5 秒。
-     * 期望串带上引号，避免 "1Ko_PC" 误匹配到 "1Ko_PC2"。 */
-    snprintf(expect, sizeof(expect), "\"%s\"", WIFI_SSID);
+     * 期望串带上引号，避免 "1Ko_PC" 误匹配到 "1Ko_PC2"。
+     *
+     * 例外：用户刚在屏上改过凭据（s_force_rejoin），此时"同名 SSID"
+     * 不能证明密码是对的，直接断开重来，不查捷径。 */
+    if (s_force_rejoin) {
+        /* 用户刚改过凭据：不能拿"同名 SSID"当已连接（密码可能变了）。
+         * 直接落到下面的"断开 + 重新关联"分支，那里本来就会先 CWQAP。 */
+        s_force_rejoin = 0;
+        r = AT_ERROR;
+    } else {
+        snprintf(expect, sizeof(expect), "\"%s\"", s_ssid);
+        r = at_send_wait("AT+CWJAP?", expect, 2000);
+    }
 
-    r = at_send_wait("AT+CWJAP?", expect, 2000);
     if (r == AT_OK) {
-        app_log("[net] wifi already on %s\r\n", WIFI_SSID);
+        app_log("[net] wifi already on %s\r\n", s_ssid);
     } else {
         /* 没连、或连的是别的 AP：先断开把状态清干净，再重新关联。
          * CWQAP 在本来就没连时会回 ERROR，忽略即可。 */
         at_send_wait("AT+CWQAP", "OK", 3000);
         vTaskDelay(pdMS_TO_TICKS(300));
 
-        snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
+        /* CWJAP 参数手工拼：\ 和 , 要转义（见 cmd_append_escaped），
+         * snprintf 的 %s 做不了这件事。160 字节 = 指令头 + 32 + 64
+         * 两个转义后上限，绰绰有余（原来 96 其实放不下满配密码）。 */
+        strcpy(cmd, "AT+CWJAP=\"");
+        cmd_append_escaped(cmd, (uint16_t)sizeof(cmd), s_ssid);
+        strcat(cmd, "\",\"");
+        cmd_append_escaped(cmd, (uint16_t)sizeof(cmd), s_pass);
+        strcat(cmd, "\"");
         r = at_send_wait(cmd, "WIFI GOT IP", 15000);
         if (r != AT_OK) { s_state = NET_DOWN; return -3; }
     }
