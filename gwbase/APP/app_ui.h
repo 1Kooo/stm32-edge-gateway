@@ -20,10 +20,9 @@ void ui_task(void *args);
  * UI 侧通过 app_data_get_snapshot() 取，避免直接读对方的变量。 */
 typedef struct {
     uint32_t seq;
-    uint8_t  light_pct;      /* 0~100 % */
     int16_t  temp_x10;       /* 253 = 25.3 C，-999 = 无效 */
-    uint16_t light_mv;
-    uint16_t temp_mv;
+    uint16_t humi_x10;       /* 450 = 45.0 %RH，0xFFFF = 无效 */
+    uint16_t temp_mv;        /* 老字段，当前无生产者，留着占位 */
 } ui_snapshot_t;
 
 /* app_freertos.c 实现的显示数据接口（ui_snapshot_t 定义在本头文件） */

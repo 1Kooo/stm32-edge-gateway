@@ -46,6 +46,12 @@ static char        s_pass[65] = WIFI_PASSWORD;
  * 用户刚改过凭据时必须重连，否则改密码这种场景永远不生效。 */
 static uint8_t     s_force_rejoin = 0;
 
+/* 最近一次 TCP 连接的目标（host:port）。
+ * net_if_ntp 要临时关掉这条 TCP 去开 UDP —— CIPMUX=0 单连接模式下
+ * 两条连接不能并存，问完时间得按原目标把 TCP 重建回来。 */
+static char        s_last_host[64];
+static uint16_t    s_last_port;
+
 /* ---------------------------------------------------------------- helpers */
 /* Read one line (terminated by '\n'). Returns length, or -1 on timeout. */
 static int at_read_line(char *out, uint16_t out_size, uint32_t timeout_ms)
@@ -420,6 +426,11 @@ int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
 
     at_send_wait("AT+CIPMUX=0", "OK", 2000);
 
+    /* 记下目标：net_if_ntp 临时关这条 TCP 开 UDP 后，要按原目标重建 */
+    strncpy(s_last_host, (host != NULL) ? host : "", sizeof(s_last_host) - 1u);
+    s_last_host[sizeof(s_last_host) - 1u] = '\0';
+    s_last_port = port;
+
     for (i = 0; i < 3; i++) {
         snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u", host, (unsigned)port);
         /* 只用 "CONNECT" 匹配是安全的：at_send_wait 已经在匹配前把
@@ -491,6 +502,157 @@ void net_if_flush_rx(void)
      * 上一条报文（或 broker 的下推）可能还没被读走。
      * 心跳前必须清干净，否则旧字节会被当成 PINGRESP。 */
     drv_uart_flush(UART_WIFI);
+}
+
+/* ---------------------------------------------------------------- NTP 对时 */
+/* 为什么不用 ESP 固件自带的 SNTP 命令（AT+CIPSNTPCUR 一类）：
+ * ESP-01S 出厂刷的多是 NonOS 老版本 AT，根本没有这组命令；
+ * 而 UDP socket 是任何版本都有的 —— 自己发一个 48 字节的
+ * NTP 请求包，同样能拿到真实时间，不挑固件版本。
+ *
+ * 应答是二进制（48 个原始字节，可能含 \r\n 的值），不能按行读，
+ * 必须逐字节走状态机：
+ *   stage 0 = 在 ASCII 噪音（Recv 48 bytes / SEND OK）里找 "+IPD," 前缀
+ *   stage 1 = 收长度数字，直到 ':'
+ *   stage 2 = 收 len 个原始字节，收满即停
+ *
+ * 单连接的坑：CIPMUX=0 下 MQTT 的 TCP 正开着时，CIPSTART UDP 会回
+ * ALREADY CONNECTED 被判失败 —— 所以这里必须先把 TCP 关掉、
+ * 问完时间再按原目标（s_last_host/port）重建回去。 */
+int net_if_ntp(uint32_t *out_ts)
+{
+    static const char *k_servers[2] = {
+        "ntp.aliyun.com", "time1.cloud.tencent.com"
+    };
+    uint8_t      pkt[48];
+    uint8_t      rx[64];
+    uint8_t      b;
+    at_result_t  r;
+    uint32_t     t0;
+    uint16_t     match = 0;
+    uint16_t     rxn   = 0;
+    int          len   = 0;
+    int          stage = 0;
+    int          done  = 0;
+    int          was_ready = (s_state == NET_READY);
+    int          si;
+    int          i;
+    int          ret = -1;
+
+    if (out_ts == NULL) return -1;
+
+    if (was_ready) {
+        at_exit_passthrough();
+        /* 单连接模式：先关掉 MQTT 的 TCP，UDP 才开得出来 */
+        at_send_wait("AT+CIPCLOSE", "OK", 3000);
+    }
+    /* 带长度的 AT+CIPSEND=48 只在非透传模式有效，先切回来 */
+    at_send_wait("AT+CIPMODE=0", "OK", 2000);
+
+    for (si = 0; si < 2 && ret != 0; si++) {
+        char cmd[80];
+
+        /* UDP 连 NTP 服务器，域名由 ESP 固件自己解析（CIPSTART 支持 DNS） */
+        snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"UDP\",\"%s\",123", k_servers[si]);
+        r = at_send_wait(cmd, "CONNECT", 8000);
+        if (r != AT_OK) continue;
+
+        /* NTPv4 请求包：48 字节全 0，只把第 0 字节设成 0x23
+         * （高 2 位 0 = 闰秒未知 / 中 3 位 4 = 版本 / 低 3 位 3 = 客户端）。
+         * 其余字段全 0 就是一份合法请求。 */
+        memset(pkt, 0, sizeof(pkt));
+        pkt[0] = 0x23u;
+
+        r = at_send_wait("AT+CIPSEND=48", ">", 3000);
+        if (r != AT_OK) {
+            at_send_wait("AT+CIPCLOSE", "OK", 3000);
+            continue;
+        }
+        drv_uart_write(UART_WIFI, pkt, 48u, 500u);
+
+        t0 = HAL_GetTick();
+        while (!done && (HAL_GetTick() - t0) < 6000u) {
+            if (drv_uart_read(UART_WIFI, &b, 1u) == 0u) {
+                vTaskDelay(1);
+                continue;
+            }
+
+            if (stage == 0) {
+                /* 逐字节匹配 "+IPD," 前缀；失配时看当前字节是不是新的 '+' */
+                if (b == (uint8_t)"+IPD,"[match]) {
+                    match++;
+                    if (match == 5u) { stage = 1; len = 0; }
+                } else {
+                    match = (b == '+') ? 1u : 0u;
+                }
+            } else if (stage == 1) {
+                if (b >= '0' && b <= '9') {
+                    len = len * 10 + (b - '0');
+                    if (len > 64) break;       /* 不是正常 NTP 包，放弃这轮 */
+                } else if (b == ':') {
+                    if (len < 48 || len > 64) break;
+                    stage = 2; rxn = 0;
+                } else if (b != '\r' && b != '\n') {
+                    break;                     /* 数字后面跟了别的，格式不对 */
+                }
+            } else {
+                rx[rxn++] = b;
+                if (rxn == (uint16_t)len) done = 1;
+            }
+        }
+
+        /* 发送时间戳在第 40~47 字节：前 4 字节大端秒数（NTP 从 1900 起数，
+         * Unix 从 1970，差 2208988800 秒）。合理性卡在 2023 年之后，防垃圾。 */
+        if (done && len >= 48) {
+            uint32_t secs = ((uint32_t)rx[40] << 24) | ((uint32_t)rx[41] << 16)
+                          | ((uint32_t)rx[42] << 8) | (uint32_t)rx[43];
+
+            secs -= 2208988800u;
+            if (secs > 1700000000u) {
+                *out_ts = secs;
+                ret = 0;
+            }
+        }
+
+        at_send_wait("AT+CIPCLOSE", "OK", 3000);
+        if (ret != 0) {
+            app_log("[ntp] %s no time\r\n", k_servers[si]);
+        }
+    }
+
+    /* 重建 TCP：把刚为开 UDP 关掉的 MQTT 链路连回来。
+     * 流程和 net_if_connect 的后半段一致（CIPSTART 3 次重试 →
+     * CIPMODE=1 → CIPSEND 进透传）。连不回去就判 DOWN，
+     * net_task 的 mqtt_connect 会失败走重连，不会死在这。 */
+    if (was_ready) {
+        char cmd[96];
+
+        r = AT_ERROR;
+        for (i = 0; i < 3; i++) {
+            snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u",
+                     s_last_host, (unsigned)s_last_port);
+            r = at_send_wait(cmd, "CONNECT", 8000);
+            if (r == AT_OK) break;
+
+            at_send_wait("AT+CIPCLOSE", "OK", 3000);
+            vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+
+        if (r == AT_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500));       /* 让 TCP 栈站稳再 CIPSEND */
+            if (at_send_wait("AT+CIPMODE=1", "OK", 2000) != AT_OK) {
+                r = AT_ERROR;
+            } else {
+                r = at_send_wait("AT+CIPSEND", ">", 3000);
+            }
+        }
+        if (r != AT_OK) {
+            app_log("[net] rebuild tcp FAIL, drop link\r\n");
+            s_state = NET_DOWN;
+        }
+    }
+
+    return ret;
 }
 
 void net_if_close(void)

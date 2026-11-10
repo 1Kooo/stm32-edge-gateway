@@ -19,8 +19,8 @@
 #include "usart.h"
 #include "led.h"
 #include "drv_uart.h"
-#include "drv_dht11.h"
-#include "drv_adc.h"
+#include "modbus_rtu.h"     /* Modbus RTU 主站：485 温湿度变送器 */
+#include "drv_rtc.h"        /* RTC：记录时间戳 */
 #include "drv_spiflash.h"
 #include "tftlcd.h"
 #include "bsp_pinmap.h"
@@ -87,8 +87,17 @@ void app_log(const char *fmt, ...)
 /* ================= 辅助 ================= */
 static uint8_t s_buf[64];
 
-/* 串口唤醒计数：只在中断叫醒任务时 +1，用来说明任务确实在睡 */
-static volatile uint32_t s_uart_wake = 0;
+/* 成功读数累计次数：每次 modbus 读到有效数据 +1，beat 那行打印出来，
+ * 用来判断 485 是在正常应答还是整条线掉着（2 秒一轮，5 秒心跳该涨 2~3）。 */
+static volatile uint32_t s_mb_ok = 0;
+
+/* Modbus 最新读数：uart_poll_task 写，sample_task 取走。
+ * pending=1 表示有一轮结果没取走，取完清零，避免同一次读数被重复记录。
+ * 失败轮次也置 pending（valid=0），否则掉线时屏幕会一直停在最后一个旧值。 */
+static volatile int16_t  s_live_temp_x10 = -999;
+static volatile uint16_t s_live_humi_x10 = 0u;
+static volatile uint8_t  s_live_valid    = 0u;   /* 0 = 这一轮失败或被闸门拦下 */
+static volatile uint8_t  s_live_pending  = 0u;
 
 /* MQTT 状态：给 ui_task 显示 */
 static volatile uint8_t  s_mqtt_up = 0;
@@ -102,40 +111,6 @@ static QueueHandle_t s_data_queue = NULL;
  * app_ui.c 通过 app_data_get_snapshot() 取，不直接摸这个变量。
  * 类型定义挪到了 app_ui.h（拆文件时随 UI 一起搬走）。 */
 static ui_snapshot_t s_latest;
-
-/* 热敏电阻电路方向：
- *   1 = VCC -- 10K -- AO -- NTC -- GND  （温度↑ 电压↓）← 最常见
- *   0 = VCC -- NTC -- AO -- 10K -- GND  （温度↑ 电压↑）
- * 实测：捏住热敏看 mV，变小填 1，变大填 0 */
-#define NTC_LOW_SIDE    1
-
-#define NTC_R25         10000.0f
-#define NTC_B           3950.0f
-#define NTC_R_FIXED     10000.0f
-#define ADC_VREF_F      3.3f
-
-/* 返回 温度 x10（253 = 25.3C）；-999 表示开路/短路 */
-static int16_t ntc_mv_to_temp_x10(uint16_t mv)
-{
-    float v = (float)mv / 1000.0f;
-    float r_ntc, inv_t, t_c;
-
-    if (v <= 0.05f || v >= 3.25f) return -999;
-
-#if NTC_LOW_SIDE
-    r_ntc = NTC_R_FIXED * v / (ADC_VREF_F - v);
-#else
-    r_ntc = NTC_R_FIXED * (ADC_VREF_F - v) / v;
-#endif
-
-    inv_t = 1.0f / 298.15f + logf(r_ntc / NTC_R25) / NTC_B;
-    t_c   = 1.0f / inv_t - 273.15f;
-
-    if (t_c < -40.0f) t_c = -40.0f;
-    if (t_c >  99.0f) t_c =  99.0f;
-
-    return (int16_t)(t_c * 10.0f);
-}
 
 static void ascii_to_buf(char *dst, uint16_t dst_size, const uint8_t *p, uint16_t n)
 {
@@ -176,8 +151,15 @@ TaskHandle_t beat_task_handle;
 void uart_poll_task(void *args);
 #define UART_TASK_STACK_SIZE 512
 #define UART_TASK_PRIORITY   2
-#define UART_TASK_PERIOD     10
+#define MB_POLL_PERIOD_MS    2000u      /* 固定 2 秒一轮：从站最快 1Hz 出数，够用又不占总线 */
 TaskHandle_t uart_task_handle;
+
+/* 读数合理性闸门（HZ8706 标称 -40~80℃ / 0~100%RH，寄存器单位 0.1）：
+ * 线松或从站刚上电时会回一帧 CRC 正确的全 0，只验 CRC 会把 0.0℃/0.0%
+ * 当成真实读数显示出来，所以再加一道数值范围判断。 */
+#define MB_TEMP_MIN_X10   (-400)
+#define MB_TEMP_MAX_X10   (800)
+#define MB_HUMI_MAX_X10   (1000)
 
 /* ================= 采样任务 ================= */
 void sample_task(void *args);
@@ -274,44 +256,91 @@ void beat_task(void *args)
                 (unsigned long)sec,
                 (unsigned)xPortGetFreeHeapSize(),
                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
-                (unsigned long)s_uart_wake);
+                (unsigned long)s_mb_ok);
         vTaskDelay(pdMS_TO_TICKS(BEAT_TASK_PERIOD));
     }
 }
 
-/* 串口中断回调（中断上下文）：叫醒等待中的任务 */
-static void uart_rx_hook(uart_id_t id)
-{
-    BaseType_t woken = pdFALSE;
-    (void)id;
-
-    if (uart_task_handle != NULL) {
-        vTaskNotifyGiveFromISR(uart_task_handle, &woken);
-        portYIELD_FROM_ISR(woken);
-    }
-}
-
+/* 485 走阻塞轮询：modbus_read_regs 自己等帧 + 校验，不需要中断唤醒。
+ * 原来挂 rx_callback 去 vTaskNotifyGiveFromISR，任务会被自己刚收到的响应
+ * 立刻叫醒（pdTRUE 只清计数，不判断是谁发的），2 秒节流形同虚设。 */
 void uart_poll_task(void *args)
 {
-    uint16_t   n;
-    TickType_t wait = 0;        /* 第一轮不阻塞：先处理开机期间已堆积的数据 */
+    uint16_t regs[MODBUS_REG_COUNT];
+    int16_t  t_x10;
+    int16_t  t_abs;
+    uint16_t h_x10;
+    int      r;
+    uint8_t  try;
     (void)args;
-
-    /* USART3 交给 net_task 独占，这里只管 485 */
-    drv_uart_set_rx_callback(UART_RS485, uart_rx_hook);
 
     while (1)
     {
-        ulTaskNotifyTake(pdTRUE, wait);     /* 无数据时完全睡眠，不占 CPU */
-        wait = portMAX_DELAY;
-        s_uart_wake++;
-
-        /* 把 485 缓冲读空并原样回显 */
-        for (;;) {
-            n = drv_uart_read(UART_RS485, s_buf, (uint16_t)sizeof(s_buf));
-            if (n == 0) break;
-            drv_uart_write(UART_RS485, s_buf, n, 100u);
+        /* 从站偶尔丢一帧很正常（总线干扰 / 上电还没就绪），
+         * 连续 3 次都失败才认输，避免云端看到一串断点。 */
+        r = MODBUS_ERR_TIMEOUT;
+        for (try = 0u; try < 3u; try++) {
+            r = modbus_read_regs(MODBUS_SLAVE_ADDR, MODBUS_REG_START,
+                                 MODBUS_REG_COUNT, regs);
+            if (r == MODBUS_OK) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));      /* 给从站一点恢复时间再重试 */
         }
+
+        if (r == MODBUS_OK) {
+            /* 温度是有符号量：-5.3℃ 时寄存器是 0xFFCB(=-53)，
+             * 按 uint16_t 会读成 65483，所以这里必须强转 int16_t */
+            t_x10 = (int16_t)regs[0];
+            h_x10 = regs[1];
+
+            /* 全 0 帧 / 超量程都判无效：这类帧 CRC 是对的，但值不是测量结果。
+             * 两路同时为 0 才算全 0 帧，单独的 0.0℃ 或 0%RH 是合法读数。 */
+            if ((regs[0] == 0u && regs[1] == 0u) ||
+                t_x10 < MB_TEMP_MIN_X10 || t_x10 > MB_TEMP_MAX_X10 ||
+                h_x10 > MB_HUMI_MAX_X10) {
+                app_log("[mb] read INVALID raw=%04X %04X (try=%u)\r\n",
+                        (unsigned)regs[0], (unsigned)regs[1],
+                        (unsigned)(try + 1u));
+
+                /* 交给 sample_task 处理：这一轮无效，让它把屏幕刷成 "--.-" */
+                taskENTER_CRITICAL();
+                s_live_valid   = 0u;
+                s_live_pending = 1u;
+                taskEXIT_CRITICAL();
+            } else {
+                t_abs = (t_x10 < 0) ? (int16_t)(-t_x10) : t_x10;
+
+                app_log("[mb] T=%s%d.%dC H=%u.%u%% (try=%u)\r\n",
+                        (t_x10 < 0) ? "-" : "",
+                        (int)(t_abs / 10), (int)(t_abs % 10),
+                        (unsigned)(h_x10 / 10u), (unsigned)(h_x10 % 10u),
+                        (unsigned)(try + 1u));
+
+                s_mb_ok++;
+
+                /* 三值 + pending 一起在临界区里写，pending 放最后，
+                 * 保证 sample_task 不会读到只更新了一半的组合 */
+                taskENTER_CRITICAL();
+                s_live_temp_x10 = t_x10;
+                s_live_humi_x10 = h_x10;
+                s_live_valid    = 1u;
+                s_live_pending  = 1u;
+                taskEXIT_CRITICAL();
+            }
+        } else {
+            app_log("[mb] read FAIL err=%d\r\n", r);
+
+            /* 掉线时不能让屏幕一直停在最后一个旧值上 */
+            taskENTER_CRITICAL();
+            s_live_valid   = 0u;
+            s_live_pending = 1u;
+            taskEXIT_CRITICAL();
+        }
+
+        /* 固定 2 秒一轮。轮询自带 200ms 超时，不再需要"串口有数据就提前醒"，
+         * 否则收到的每个字节都会把任务从睡眠里拽出来一次。 */
+        vTaskDelay(pdMS_TO_TICKS(MB_POLL_PERIOD_MS));
     }
 }
 
@@ -337,6 +366,7 @@ static int      log_mark_sent(uint32_t addr);
 static wifi_cfg_t s_cfg_pending;
 static uint8_t    s_cfg_has_pending = 0;
 static uint8_t    s_wifi_fail = 0;      /* 连续关联失败次数，到达 3 次就回退 */
+static uint8_t    s_ntp_done  = 0;      /* 本次上电是否已对过时：只问一次，失败不重试 */
 
 /* WiFi 扫描（UI 发起，net_task 执行）。
  * 串口 AT 机只有 net_task 在开，UI 任务只能隔着这几个变量提需求，
@@ -370,8 +400,9 @@ void net_task(void *args)
     uint16_t      n;
     char          line[96];
     char          topic[40];
-    char          payload[72];
+    char          payload[96];
     char          tbuf[12];
+    char          hbuf[12];
     uint8_t       rx[16];
     uint32_t      last_ping;
     uint32_t      backlog;
@@ -407,6 +438,7 @@ void net_task(void *args)
             r = app_ota_run();
             if (r != 0) {
                 app_log("[ota] FAILED (%d), back to normal\r\n", r);
+                app_ota_set_fail((int8_t)r);   /* 转告弹窗：红字显示失败原因 */
             }
 
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -495,6 +527,23 @@ void net_task(void *args)
         app_log("[net] tcp ready\r\n");
         s_wifi_fail = 0;                    /* 关联成功，失败计数清零 */
 
+        /* 2.5 对时：刚拿到 IP，趁 MQTT 还没连，先问一次 NTP。
+         * RTC 没电池/首次上电时只有编译时刻，起点天然落后几分钟
+         * （编译到上板那段时间）；联网后拿真实时间写进 RTC 抹掉它。
+         * 每次上电只问一次：失败就用现有时间继续跑，不值得反复重试
+         * —— NTP 不可用多半是外网不通，MQTT 那条路也未必好。 */
+        if (s_ntp_done == 0u) {
+            uint32_t ntp_ts;
+
+            s_ntp_done = 1u;
+            if (net_if_ntp(&ntp_ts) == 0) {
+                app_log("[ntp] unix=%lu\r\n", (unsigned long)ntp_ts);
+                drv_rtc_set_unix(ntp_ts);
+            } else {
+                app_log("[ntp] sync FAIL, keep current time\r\n");
+            }
+        }
+
         /* 3. MQTT CONNECT：客户端 ID 用私钥，账号密码留空 */
         r = mqtt_connect(BEMFA_UID, MQTT_KEEPALIVE_S, 3000);
         if (r != 0) {
@@ -561,19 +610,24 @@ void net_task(void *args)
 
                     if (log_peek_next(&e, &addr) != 0) break;   /* 追上写指针了 */
 
-                    if (e.temp_x10 == -999) {
-                        snprintf(payload, sizeof(payload),
-                                 "{\"light\":%u,\"seq\":%lu}",
-                                 (unsigned)e.humi_x10, (unsigned long)e.seq);
-                    } else {
-                        int16_t t = e.temp_x10;
+                    /* 温湿度都按 x10 还原成一位小数。
+                     * 0x03 起 humi_x10 是湿度（0~1000），不再是光照百分比。 */
+                    {
+                        int16_t  t  = e.temp_x10;
+                        uint16_t hm = e.humi_x10;
 
                         if (t < 0) snprintf(tbuf, sizeof(tbuf), "-%d.%d", (-t) / 10, (-t) % 10);
                         else       snprintf(tbuf, sizeof(tbuf), "%d.%d",   t / 10,     t % 10);
 
+                        snprintf(hbuf, sizeof(hbuf), "%u.%u",
+                                 (unsigned)(hm / 10u), (unsigned)(hm % 10u));
+
+                        /* ts = RTC Unix 时间戳：云端按真实时间落库/画曲线，
+                         * 断电重启时间线不归零（RTC 降级时是上电秒数） */
                         snprintf(payload, sizeof(payload),
-                                 "{\"temp\":%s,\"light\":%u,\"seq\":%lu}",
-                                 tbuf, (unsigned)e.humi_x10, (unsigned long)e.seq);
+                                 "{\"ts\":%lu,\"temp\":%s,\"humi\":%s,\"seq\":%lu}",
+                                 (unsigned long)e.ts,
+                                 tbuf, hbuf, (unsigned long)e.seq);
                     }
 
                     if (mqtt_publish(topic, (const uint8_t *)payload,
@@ -699,6 +753,22 @@ static int log_store_init(void)
             if (e->magic != LOG_MAGIC || e->rsv != LOG_FMT_VER) {  /* 空位或旧格式 */
                 s_log_wptr = addr + i;
                 s_log_full = 0;
+
+                /* 旧格式（magic 对得上、版本号不对）：这块区域从没擦过。
+                 * NOR 只能 1→0，直接往上写会把新旧字节"与"在一起，
+                 * magic/rsv 永远写不对 —— 每次扫描都判成空位，反复写同一处，
+                 * 日志区等于废掉。把写指针推到下一个扇区边界，
+                 * 让 log_append 里的"扇区起点先擦后写"生效。
+                 * 真空位（magic 是擦除态 0xFF）本来就干净，留在原位即可。 */
+                if (e->magic == LOG_MAGIC) {
+                    s_log_wptr = (s_log_wptr + FLASH_SECTOR_SIZE - 1u)
+                                 & ~(FLASH_SECTOR_SIZE - 1u);
+                    if (s_log_wptr >= LOG_END) {
+                        s_log_wptr = LOG_END;
+                        s_log_full = 1;
+                    }
+                }
+
                 if (!rptr_found) s_log_rptr = s_log_wptr;
                 goto done;
             }
@@ -885,62 +955,72 @@ void storage_task(void *args)
 void sample_task(void *args)
 {
     sensor_record_t rec;
-    uint32_t seq;
-    uint16_t light, temp;
+    int16_t  t_x10;
+    uint16_t h_x10;
+    uint8_t  has_new;
+    uint8_t  ok;
+    uint32_t dropped = 0u;
     (void)args;
 
-    drv_adc_init();
-
-    /* 等存储区扫描完成，接着上次的序号往下数。
-     * 否则每次重启 seq 都从 1 开始，云端会看到序号周期性回退。 */
-    {
-        uint32_t waited = 0;
-
-        while (!s_log_ready && waited < 250u) {     /* 最多等 5 秒，防止卡死 */
-            vTaskDelay(pdMS_TO_TICKS(20));
-            waited++;
-        }
-        seq = s_last_seq;
-    }
+    /* 初值：还没拿到任何读数，屏幕显示 "--.-" */
+    taskENTER_CRITICAL();
+    s_latest.seq      = 0u;
+    s_latest.temp_x10 = -999;
+    s_latest.humi_x10 = 0xFFFFu;
+    s_latest.temp_mv  = 0u;
+    taskEXIT_CRITICAL();
 
     while (1)
     {
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_TASK_PERIOD));
+        /* 取走 uart_poll_task 这一轮的结果。清零也在临界区里，
+         * 否则两次采样之间可能把同一轮读数记录两遍。 */
+        taskENTER_CRITICAL();
+        has_new = s_live_pending;
+        t_x10   = s_live_temp_x10;
+        h_x10   = s_live_humi_x10;
+        ok      = s_live_valid;
+        s_live_pending = 0u;
+        taskEXIT_CRITICAL();
 
-        light = drv_adc_read_raw(ADC_CH_LIGHT);
-        temp  = drv_adc_read_raw(ADC_CH_TEMP);
-        seq++;
+        /* 这一轮还没出新读数（485 正在重试），不动屏幕也不产生记录 */
+        if (has_new == 0u) {
+            vTaskDelay(pdMS_TO_TICKS(SAMPLE_TASK_PERIOD));
+            continue;
+        }
 
-        /* 落盘和上屏必须是同一份换算结果，否则补传会发出原始比例而不是温度。
-         * humi_x10 这个字段被复用为光照百分比（0~100），和 s_latest 保持一致。 */
-        {
-            uint16_t light_mv = (uint16_t)((uint32_t)light * 3300u / 4096u);
-            uint16_t temp_mv  = (uint16_t)((uint32_t)temp  * 3300u / 4096u);
-            int16_t  t_x10    = ntc_mv_to_temp_x10(temp_mv);
-            uint8_t  l_pct    = (uint8_t)(100u - ((light * 100u) / 4095u));
-
-            rec.seq      = seq;
-            rec.ts       = (uint32_t)(xTaskGetTickCount() / configTICK_RATE_HZ);
-            rec.temp_x10 = t_x10;
-            rec.humi_x10 = (uint16_t)l_pct;
-            rec.valid    = (t_x10 == -999) ? 0u : 1u;
-            rec.rsv[0]   = 0;
-            rec.rsv[1]   = 0;
-            rec.rsv[2]   = 0;
-
-            /* 不打印，只更新快照，由 ui_task 显示 */
+        /* 读数无效：不写 Flash、不上报，只把屏幕刷成无效态。
+         * 否则云端会出现 0.0℃ 这种假数据点，比少一条更糟。 */
+        if (ok == 0u) {
             taskENTER_CRITICAL();
-            s_latest.seq       = seq;
-            s_latest.light_pct = l_pct;
-            s_latest.temp_x10  = t_x10;
-            s_latest.light_mv  = light_mv;
-            s_latest.temp_mv   = temp_mv;
+            s_latest.temp_x10 = -999;
+            s_latest.humi_x10 = 0xFFFFu;
             taskEXIT_CRITICAL();
+
+            vTaskDelay(pdMS_TO_TICKS(SAMPLE_TASK_PERIOD));
+            continue;
         }
 
+        /* 序号接着 Flash 里的最大号往下排，重启后不会从 0 重来 */
+        rec.seq      = ++s_last_seq;
+        rec.ts       = drv_rtc_unix();   /* RTC 真实时间；降级时等于上电秒数 */
+        rec.temp_x10 = t_x10;
+        rec.humi_x10 = h_x10;
+        rec.valid    = 1u;
+
+        /* 队列满就丢这一条：宁可少一条，也不能阻塞采样 */
         if (xQueueSend(s_data_queue, &rec, 0) != pdTRUE) {
-            app_log("[sample] queue full, drop #%lu\r\n", (unsigned long)seq);
+            if (dropped++ == 0u) {
+                app_log("[sample] queue FULL, drop\r\n");
+            }
         }
+
+        taskENTER_CRITICAL();
+        s_latest.seq      = rec.seq;
+        s_latest.temp_x10 = t_x10;
+        s_latest.humi_x10 = h_x10;
+        taskEXIT_CRITICAL();
+
+        vTaskDelay(pdMS_TO_TICKS(SAMPLE_TASK_PERIOD));
     }
 }
 

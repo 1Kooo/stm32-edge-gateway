@@ -25,6 +25,7 @@
 #include "app_wifi_cfg.h"
 #include "net_if.h"
 #include "app_config.h"
+#include "drv_rtc.h"
 
 /* 外 Flash 自检第一步就是擦 0x000000 —— 那正是 OTA 固件暂存槽。
  * 只要 APP 跑一次自检，暂存的新固件就没了，OTA 会随机失败且极难查。
@@ -87,7 +88,10 @@ void app_main(void)
     rf = drv_flash_init();
 
     /* ---------------- report ---------------- */
-    printf("\r\n===== GW %s / step2 =====\r\n", APP_VERSION);
+    /* 带上编译时间戳：以后上电第一行就能和手头 hex 的时间对一下，
+     * 避免"烧的是旧固件却以为是新固件"导致的无效排查。
+     * __DATE__ / __TIME__ 是编译器内置宏，每次编译自动更新，零维护。 */
+    printf("\r\n===== GW %s build " __DATE__ " " __TIME__ " =====\r\n", APP_VERSION);
     /* 向量表实际地址。跑在 0x08010000 时这里必须也是 0x08010000，
      * 是判断 bootloader 跳转和 VECT_TAB_OFFSET 有没有对上的直接证据。 */
     printf("[app] vtor 0x%08X\r\n", (unsigned)SCB->VTOR);
@@ -106,6 +110,11 @@ void app_main(void)
     net_if_set_wifi(wifi_cfg_ssid(), wifi_cfg_pass());
 
     drv_uart_write(UART_WIFI, (const uint8_t *)"AT\r\n", 4u, 100u);
+
+    /* RTC：给每条传感器记录盖真实时间戳。必须在起任务前初始化 ——
+     * 首次开 LSE 晶振要等最多 3 秒，这个等待不能挂在任何任务里。
+     * 电池在：一行 [rtc] time ok 后零开销；电池不在：退回编译时刻。 */
+    drv_rtc_init();
 
 #if FLASH_SELFTEST
     flash_selftest();
@@ -139,6 +148,16 @@ void app_main(void)
      * 放在调度器启动前：此时各任务还没跑，UART 没人读，
      * 擦 Flash 那 200~500ms 里丢掉的数据无所谓。
      * 平时 swap_state 不是 TRYING，这个函数直接返回 0，不碰 Flash。 */
+    {
+        /* TRYING 态先在自检页画一行提示：接下来的十几秒在写黄金备份，
+         * 用户不用对着"卡住的自检页"瞎猜。正常开机零开销零痕迹。 */
+        ota_flag_t peek;
+
+        if (ota_flag_load(&peek) == 0 && peek.swap_state == OTA_SWAP_TRYING) {
+            LCD_ShowString(10, 190, tftlcd_data.width, tftlcd_data.height, 16,
+                           (u8 *)"OTA golden backup ...");
+        }
+    }
     ota_r = app_ota_confirm();
     if (ota_r > 0) {
         printf("[ota] new firmware confirmed, boot_try cleared\r\n");

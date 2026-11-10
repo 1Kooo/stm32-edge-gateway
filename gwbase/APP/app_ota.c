@@ -70,6 +70,22 @@ static uint8_t s_chunk[OTA_READ_STEP];   /* 收数缓冲，放静态区不占任
 static volatile uint8_t s_req  = 0;      /* 有 OTA 请求待处理 */
 static volatile uint8_t s_busy = 0;      /* 正在下载，storage_task 别来抢 SPI */
 
+/* OTA 进度：net_task 里写，ui_task 500ms 刷一次屏时读。
+ * uint8_t 单字节，读写天然原子，不需要临界区。
+ * 失败路径不用清零：UI 只在 app_ota_busy()==1 时才显示这些值，
+ * 任何失败出口都会把 s_busy 清 0，屏幕自然回到正常显示。 */
+static volatile uint8_t s_ota_phase = 0; /* 1 = 准备(连接+擦Flash)  2 = 下载 */
+static volatile uint8_t s_ota_pct   = 0; /* 0~100 */
+
+/* 弹窗用的结果状态：
+ * s_ota_done 只在最后一步（CRC 过 + 头写成功 + pending 标志写成功）才置 1，
+ * 此刻 300ms 后就复位 —— UI 看到 done=1 就敢写"升级完成"，不存在假成功。
+ * s_ota_err 由 net_task 在 app_ota_run 返回非 0 时单点写入（8 个失败出口
+ * 逐个加太噪，net_task 那一个 if 是唯一汇聚点）。 */
+static volatile uint8_t  s_ota_done = 0;   /* 1 = 下载+校验+标志全过，马上复位 */
+static volatile int8_t   s_ota_err  = 0;   /* app_ota_run 的失败返回码，0 = 无 */
+static volatile uint32_t s_ota_ver  = 0u;  /* 目标固件版本（握手后从固件头取） */
+
 /* ================= 请求标志 ================= */
 
 void app_ota_request(void)
@@ -97,6 +113,36 @@ uint8_t app_ota_pending(void)
 uint8_t app_ota_busy(void)
 {
     return s_busy;
+}
+
+uint8_t app_ota_phase(void)
+{
+    return s_ota_phase;
+}
+
+uint8_t app_ota_pct(void)
+{
+    return s_ota_pct;
+}
+
+uint8_t app_ota_done(void)
+{
+    return s_ota_done;
+}
+
+int8_t app_ota_err(void)
+{
+    return s_ota_err;
+}
+
+void app_ota_set_fail(int8_t code)
+{
+    s_ota_err = code;
+}
+
+uint32_t app_ota_ver(void)
+{
+    return s_ota_ver;
 }
 
 /* ================= 收数 ================= */
@@ -172,6 +218,10 @@ int app_ota_run(void)
     int         r;
 
     s_busy = 1;
+    s_ota_phase = 1;      /* 准备阶段：连服务器 + 擦外部 Flash */
+    s_ota_pct   = 0;
+    s_ota_done  = 0;      /* 清上一次的结果，弹窗从干净状态开始 */
+    s_ota_err   = 0;
 
     app_log("\r\n[ota] ===== start =====\r\n");
     app_log("[ota] server %s:%u\r\n", OTA_HOST, (unsigned)OTA_PORT);
@@ -216,6 +266,7 @@ int app_ota_run(void)
     app_log("[ota] fw v%u.%u  len=%lu  crc=0x%08lX\r\n",
             (unsigned)(hdr.version >> 16), (unsigned)(hdr.version & 0xFFFFu),
             (unsigned long)hdr.fw_len, (unsigned long)hdr.fw_crc);
+    s_ota_ver = hdr.version;   /* 给弹窗显示 "V0.6 -> V0.7" 用 */
 
     if (hdr.fw_len == 0u || hdr.fw_len > FW_MAX_LEN) {
         app_log("[ota] fw_len %lu out of range (max %lu)\r\n",
@@ -247,6 +298,9 @@ int app_ota_run(void)
             app_log("[ota] erase %lu/%lu\r\n",
                     (unsigned long)(i + 1u), (unsigned long)sectors);
         }
+
+        /* 擦除进度也给 UI：一扇区一更新，开销就是一次写单字节 */
+        s_ota_pct = (uint8_t)((i + 1u) * 100u / sectors);
     }
 
     /* 4. 逐块拉取 */
@@ -288,6 +342,10 @@ int app_ota_run(void)
                     (unsigned long)(off + len), (unsigned long)hdr.fw_len,
                     (unsigned long)((off + len) * 100u / hdr.fw_len));
         }
+
+        /* 下载进度给 UI：和上面日志同一个公式，白拿 */
+        s_ota_phase = 2;
+        s_ota_pct   = (uint8_t)((off + len) * 100u / hdr.fw_len);
     }
 
     crc = ota_crc32_end(crc);
@@ -334,6 +392,8 @@ int app_ota_run(void)
 
     app_log("[ota] ===== OK, %lu bytes staged =====\r\n",
             (unsigned long)hdr.fw_len);
+
+    s_ota_done = 1;    /* 到这里 = CRC 过 + 头写成功 + pending 已置，板上重启倒计时 */
 
     net_if_close();
     s_busy = 0;

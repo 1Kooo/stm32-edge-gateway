@@ -481,6 +481,26 @@
               <FilePath>.\drv\drv_uart.h</FilePath>
             </File>
             <File>
+              <FileName>modbus_rtu.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\modbus_rtu.c</FilePath>
+            </File>
+            <File>
+              <FileName>modbus_rtu.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\modbus_rtu.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_rtc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\drv\drv_rtc.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_rtc.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\drv\drv_rtc.h</FilePath>
+            </File>
+            <File>
               <FileName>drv_spiflash.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\drv\drv_spiflash.c</FilePath>
@@ -489,26 +509,6 @@
               <FileName>drv_spiflash.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\drv\drv_spiflash.h</FilePath>
-            </File>
-            <File>
-              <FileName>drv_dht11.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\drv\drv_dht11.c</FilePath>
-            </File>
-            <File>
-              <FileName>drv_dht11.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\drv\drv_dht11.h</FilePath>
-            </File>
-            <File>
-              <FileName>drv_adc.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\drv\drv_adc.c</FilePath>
-            </File>
-            <File>
-              <FileName>drv_adc.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\drv\drv_adc.h</FilePath>
             </File>
           </Files>
         </Group>

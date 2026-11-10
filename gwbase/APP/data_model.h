@@ -40,7 +40,10 @@ typedef struct {
 #define LOG_MAGIC        0xA5u      /* record is valid          */
 #define LOG_ST_UNSENT    0xFFu      /* erased value = not sent  */
 #define LOG_ST_SENT      0x00u      /* marked sent, never erased*/
-#define LOG_FMT_VER      0x02u      /* record layout version, stored in rsv */
+#define LOG_FMT_VER      0x04u      /* record layout version, stored in rsv
+                                     * 0x04: ts 是 RTC Unix 时间戳；
+                                     * 0x03 及以前 ts 是上电秒数，语义不同，
+                                     * 升版本让老记录在扫描时被判无效 */
 
 typedef struct {
     uint32_t seq;

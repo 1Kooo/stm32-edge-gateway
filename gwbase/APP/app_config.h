@@ -33,7 +33,7 @@
 #endif
 
 #ifndef BEMFA_HOST
-#define BEMFA_HOST       "mqtt.bemfa.com"
+#define BEMFA_HOST       "mqtt.bemfa.com
 #endif
 
 #ifndef BEMFA_PORT
@@ -59,9 +59,33 @@
  *
  * V0.5 = V0.4 的回滚底座 + 屏上配网全链路（外部 Flash 双槽存储 /
  * 断链自动换网重连 / 配错 3 次自动回退）+ 中文字库与中文界面 +
- * 触摸 y 轴镜像修复 + UI 拆分到 app_ui.c + 扫描选网。 */
+ * 触摸 y 轴镜像修复 + UI 拆分到 app_ui.c + 扫描选网。
+ * V0.6 = V0.5 + Modbus RTU 温湿度采集（485 / P8 端子）+ 数据链路接入
+ * （LOG_FMT_VER 0x03：humi_x10 语义从光照换湿度）+ OTA 屏显进度。
+ * V0.7 = V0.6 + RTC 真实时间戳（LOG_FMT_VER 0x04：ts 换 Unix 秒，
+ * MQTT 报文加 ts 键）+ OTA 弹窗（遮罩/版本行/失败反馈/黄金备份进度）
+ * + KEY2 三页循环导航。
+ * V0.8 = V0.7 + 首页顶栏改显 RTC 实时时间（运行时长移到关于页）、
+ * 关于页加「时间」行、OTA 弹窗背景渐变 + 面板阴影。
+ * V0.9 = V0.8 + 联网 NTP 对时（UDP 直发 48 字节请求，不挑 ESP AT
+ * 固件版本），抹掉"编译时刻"起点带来的固定偏差。 */
 #ifndef APP_VERSION
-#define APP_VERSION      "V0.5"
+#define APP_VERSION      "V0.9"
+#endif
+
+/* Modbus RTU 主站：RS485 上挂的从站。
+ * 换从站型号只改这三个值，寄存器地址和换算关系以从站手册为准。
+ * HZ8706：地址 1、9600 8N1 无校验、0001H 温度 / 0002H 湿度，值除以 10。 */
+#ifndef MODBUS_SLAVE_ADDR
+#define MODBUS_SLAVE_ADDR   0x01u
+#endif
+
+#ifndef MODBUS_REG_START
+#define MODBUS_REG_START    0x0001u
+#endif
+
+#ifndef MODBUS_REG_COUNT
+#define MODBUS_REG_COUNT    2u
 #endif
 
 #endif /* __APP_CONFIG_H */

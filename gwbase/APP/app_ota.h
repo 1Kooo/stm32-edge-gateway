@@ -46,6 +46,42 @@ uint8_t app_ota_pending(void);
 uint8_t app_ota_busy(void);
 
 /**
+ * @brief OTA 当前阶段（给 UI 显示进度条用）。仅当 app_ota_busy() 为 1 时有意义。
+ * @return 1 = 准备（连服务器 + 擦外部 Flash）  2 = 下载
+ */
+uint8_t app_ota_phase(void);
+
+/**
+ * @brief OTA 当前进度百分比 0~100（给 UI 显示进度条用）。
+ *        仅当 app_ota_busy() 为 1 时有意义。
+ */
+uint8_t app_ota_pct(void);
+
+/**
+ * @brief OTA 是否"真的成功"：下载完 + CRC 校验过 + 固件头写成功 + pending
+ *        标志写成功，此刻几秒内必然复位。UI 看到 1 才能显示"升级完成"。
+ */
+uint8_t app_ota_done(void);
+
+/**
+ * @brief 最近一次 OTA 的失败码（= app_ota_run 的返回值）。0 = 无。
+ *        仅当 busy()==0 且 done()==0 且 非 0 时表示"刚失败"。
+ */
+int8_t app_ota_err(void);
+
+/**
+ * @brief net_task 专用：app_ota_run 返回非 0 时把失败码转告 UI。
+ *        失败出口在 app_ota_run 里有 8 个，net_task 的这一个 if 是唯一汇聚点。
+ */
+void app_ota_set_fail(int8_t code);
+
+/**
+ * @brief 目标固件版本（握手成功后从固件头取，高 16 位主版本 / 低 16 位次版本）。
+ *        0 = 还没握手到、版本未知。
+ */
+uint32_t app_ota_ver(void);
+
+/**
  * @brief 执行一次完整的下载。仅在 net_task 上下文调用。
  *
  * 调用前必须已经断开 MQTT（net_if_close），本函数自己会重新建立

@@ -10,6 +10,8 @@
 #include "drv_spiflash.h"
 #include "stm32f4xx_hal.h"
 #include <string.h>
+#include <stdio.h>
+#include "tftlcd.h"       /* 黄金备份进度直接刷在开机自检页上（裸 LCD，不走 LVGL） */
 
 /* APP 区起点，与 boot/Src/app_jump.h 的 APP_BASE 同值。
  * 内部 Flash 内存映射，直接按指针读。 */
@@ -188,6 +190,7 @@ static int golden_backup_write(ota_flag_t *flag)
     uint32_t sectors;
     uint32_t i;
     uint32_t next_report = 65536u;
+    char     lcd_buf[40];
 
     /* 合法性兜底。装完新固件后，fw_len / fw_crc 记的就是刚装进 APP 的这份 */
     if (fw_len == 0u || fw_len > (1024u * 1024u)) {
@@ -213,6 +216,13 @@ static int golden_backup_write(ota_flag_t *flag)
             app_log("[golden] erase FAIL at %u\r\n", (unsigned)i);
             return -1;
         }
+        /* 每 16 个扇区往自检页刷一行进度，纯 ASCII 不用管字库 */
+        if ((i % 16u) == 0u) {
+            sprintf(lcd_buf, "OTA golden erase %lu/%lu",
+                    (unsigned long)(i + 1u), (unsigned long)sectors);
+            LCD_ShowString(10, 190, tftlcd_data.width, tftlcd_data.height,
+                           16, (u8 *)lcd_buf);
+        }
     }
 
     /* 搬运：内部 Flash 内存映射直接读，分块写外部 */
@@ -232,6 +242,10 @@ static int golden_backup_write(ota_flag_t *flag)
         if (off >= next_report && off < fw_len) {
             app_log("[golden] %u/%u\r\n", (unsigned)off, (unsigned)fw_len);
             next_report += 65536u;
+            sprintf(lcd_buf, "OTA golden copy %lu%%",
+                    (unsigned long)(off * 100u / fw_len));
+            LCD_ShowString(10, 190, tftlcd_data.width, tftlcd_data.height,
+                           16, (u8 *)lcd_buf);
         }
     }
 
@@ -260,6 +274,8 @@ static int golden_backup_write(ota_flag_t *flag)
     flag->golden_crc = fw_crc;
     app_log("[golden] backup ok: %u bytes crc=0x%08X\r\n",
             (unsigned)fw_len, (unsigned)fw_crc);
+    LCD_ShowString(10, 190, tftlcd_data.width, tftlcd_data.height, 16,
+                   (u8 *)"OTA golden backup ok");
     return 0;
 }
 

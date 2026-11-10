@@ -53,6 +53,13 @@ uint16_t net_if_recv(uint8_t *buf, uint16_t maxlen, uint32_t timeout_ms);
  * the reply, which makes a dead link look perfectly healthy. */
 void net_if_flush_rx(void);
 
+/* 问一次 NTP 服务器，拿到 UTC Unix 秒写进 *out_ts。
+ * 返回 0 成功，负数失败（时间维持现状，不比不问差）。
+ * 只能 net_task 调：串口 AT 机同一时刻只有一个主人。
+ * 透传中调用是安全的：单连接模式下会先关掉当前 TCP 去开 UDP，
+ * 问完按原目标把 TCP 重建回来（重建失败判 DOWN，走重连）。 */
+int net_if_ntp(uint32_t *out_ts);
+
 void net_if_close(void);
 
 net_state_t net_if_state(void);
