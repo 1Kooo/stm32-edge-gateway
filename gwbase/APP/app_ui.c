@@ -174,7 +174,7 @@ static void ui_build_main(lv_obj_t *scr)
     lv_label_set_text(s_ui_net_text, "离线");
 
     s_ui_clock = ui_label(scr, 380, 9, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(s_ui_clock, "00:00:00");
+    lv_label_set_text(s_ui_clock, "--:--:--");
 
     /* ---- 温度卡 ---- */
     card = ui_card(scr, 14, 32, 216, 112);
@@ -1057,7 +1057,7 @@ static void ui_build_about(lv_obj_t *scr)
     lv_label_set_text(s_ui_heap, "0 B");
 
     lb = ui_label(card, 14, 178, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(lb, "固件 V0.9 · 中文字库 1084 字形");
+    lv_label_set_text(lb, "固件 V1.0 · 中文字库 1084 字形");
 }
 
 static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连点 */
@@ -1353,9 +1353,11 @@ void ui_task(void *args)
                 (unsigned long)(up_s % 60u));
         lv_label_set_text(s_ui_uptime, buf);
 
-        /* 首页顶栏：RTC 实时时间。RTC 降级（LSE 起不来）时退回上电时长，
-         * 不让那个格子空着 —— buf 里此刻正好还是上面那份时长，直接用。 */
-        if (drv_rtc_ok()) {
+        /* 首页顶栏：只有校准过的时间才显示。
+         * drv_rtc_ok 为假 = LSE 起不来；drv_rtc_synced 为假 = RTC 里的值还只是
+         * 编译时刻兜底（断电丢了备份域、尚未联网对时），那个点数是假的，
+         * 与其让人拿它看数据时间，不如空着显示 --:--:--。 */
+        if (drv_rtc_ok() && drv_rtc_synced()) {
             uint32_t now = drv_rtc_unix();
 
             drv_rtc_split(now, &rtc_y, &rtc_mo, &rtc_d, &rtc_h, &rtc_mi, &rtc_s);
@@ -1370,7 +1372,8 @@ void ui_task(void *args)
                     (unsigned)rtc_h, (unsigned)rtc_mi, (unsigned)rtc_s);
             lv_label_set_text(s_ui_datetime, buf);
         } else {
-            lv_label_set_text(s_ui_clock, buf);   /* 降级 = 上电时长 */
+            lv_label_set_text(s_ui_clock, "--:--:--");
+            lv_label_set_text(s_ui_datetime, "--:--");
         }
 
         sprintf(buf, "%u B", (unsigned)xPortGetFreeHeapSize());

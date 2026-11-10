@@ -23,6 +23,7 @@
 #include <string.h>
 
 #define RTC_BKP_MAGIC   0x32F1u     /* 写在 BKP0R：值还在 = 时间没断过 */
+#define RTC_SYNC_MAGIC  0x53594E43u /* 写在 BKP1R："SYNC"：时间被 NTP 校准过 */
 
 static RTC_HandleTypeDef s_rtc;    /* HAL 句柄，只有本文件用 */
 static uint8_t           s_rtc_ok = 0;   /* 1 = RTC 在跑真实时间；0 = 降级用上电秒数 */
@@ -39,9 +40,8 @@ static uint8_t rtc_time_retained(void)
     return 1;
 }
 
-/* 民用日期 -> 自 1970-01-01 的天数（Howard Hinnant 算法）。
- * 只在 drv_rtc_unix 里用一次，但单独放一个函数是值得的：
- * 这是纯数学，和硬件读数解耦，验证时可以拿已知日期手算对答案。 */
+/* 民用日期 -> 距 1970-01-01 的天数（Howard Hinnant 算法）。
+ * 纯数学，和硬件读数解耦，可以拿已知日期手算核对。 */
 static long days_from_civil(int y, int m, int d)
 {
     long era;
@@ -142,6 +142,8 @@ void drv_rtc_init(void)
 
         rtc_set_build_time();
         HAL_RTCEx_BKUPWrite(&s_rtc, RTC_BKP_DR0, RTC_BKP_MAGIC);
+        /* 编译时刻只是起点、不是校准过的时间，同步标记必须清掉 */
+        HAL_RTCEx_BKUPWrite(&s_rtc, RTC_BKP_DR1, 0u);
         printf("[rtc] time set to build time (first boot or battery lost)\r\n");
     } else {
         /* 电池把时间和配置都保住了：一行都不用写，直接用 */
@@ -199,6 +201,22 @@ uint8_t drv_rtc_ok(void)
     return s_rtc_ok;
 }
 
+/* NTP 成功后由 net_task 调：把"这份时间校准过"钉进备份寄存器。
+ * 电池在位时可跨断电保留，冷启动不必等联网就知道时间可信。 */
+void drv_rtc_mark_synced(void)
+{
+    /* 备份域可能已被别处重新上锁，这里幂等地再解一次 */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+    HAL_RTCEx_BKUPWrite(&s_rtc, RTC_BKP_DR1, RTC_SYNC_MAGIC);
+}
+
+/* 1 = 当前时间经过 NTP 校准（或电池保住了校准标记）；0 = 仍是编译时刻兜底值 */
+uint8_t drv_rtc_synced(void)
+{
+    return (HAL_RTCEx_BKUPRead(&s_rtc, RTC_BKP_DR1) == RTC_SYNC_MAGIC) ? 1u : 0u;
+}
+
 int drv_rtc_set_unix(uint32_t ts)
 {
     RTC_TimeTypeDef t;
@@ -229,7 +247,8 @@ int drv_rtc_set_unix(uint32_t ts)
     HAL_RTC_SetTime(&s_rtc, &t, RTC_FORMAT_BIN);
     HAL_RTC_SetDate(&s_rtc, &d, RTC_FORMAT_BIN);
 
-    /* 电池断电再来时靠这个 magic 判断"时间没断过" */
+    /* 注意：这个 magic 只说明"备份域写过时间"，断电时它和 BDCR 一起被清，
+     * 所以它能证明"这次没断电"，不能证明"时间是准的" —— 准不准看 DR1。 */
     HAL_RTCEx_BKUPWrite(&s_rtc, RTC_BKP_DR0, RTC_BKP_MAGIC);
 
     printf("[rtc] synced to %04u-%02u-%02u %02u:%02u:%02u\r\n",

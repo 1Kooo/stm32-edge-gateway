@@ -34,4 +34,11 @@ void drv_rtc_split(uint32_t ts, uint16_t *year, uint8_t *mon, uint8_t *day,
 /* 1 = RTC 在跑真实时间；0 = 降级态（上电秒数） */
 uint8_t drv_rtc_ok(void);
 
+/* NTP 对时成功后调一次：写备份寄存器里的"已校准"标记（跨断电保留） */
+void drv_rtc_mark_synced(void);
+
+/* 1 = 当前时间经过校准（或电池保住了校准标记），可以当真时间显示；
+ * 0 = 只是编译时刻兜底值，界面应显示 --:-- 而不是这个假时间 */
+uint8_t drv_rtc_synced(void);
+
 #endif /* __DRV_RTC_H */

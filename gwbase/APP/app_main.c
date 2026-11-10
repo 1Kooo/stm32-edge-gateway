@@ -1,11 +1,14 @@
 /**
  * @file    app_main.c
- * @brief   Application entry - Step 2: three UARTs online.
+ * @brief   Application entry: init everything, then hand over to FreeRTOS.
  *
- * Behaviour:
- *   - init USART2 (RS485) and USART3 (WiFi)
- *   - report status on the debug console and on the LCD
- *   - main loop: RS485 echoes bytes back, WiFi traffic is dumped to console
+ * 顺序（有依赖关系，不能随意换）：
+ *   1. 两个业务串口（RS485 / WiFi）+ 外部 Flash + RTC
+ *   2. 自检横幅（串口 + 裸 LCD 自检页）
+ *   3. WiFi 凭据（外部 Flash 配置区，喂给 net_if）
+ *   4. LVGL 移植层（必须在起任务前，见下方注释）
+ *   5. OTA 启动确认（新固件首跑，写 DONE 清 boot_try）
+ *   6. App_freeRTOS_start() 起 7 个任务，不再回来
  *
  * USART1 is owned by Public/usart.c (printf), so we never re-init it here.
  */
@@ -128,14 +131,13 @@ void app_main(void)
                    (u8 *)(r485  ? "USART2 9600   FAIL" : "USART2 9600   ok"));
     LCD_ShowString(10, 100, tftlcd_data.width, tftlcd_data.height, 16,
                    (u8 *)(rwifi ? "USART3 115200 FAIL" : "USART3 115200 ok"));
-    LCD_ShowString(10, 140, tftlcd_data.width, tftlcd_data.height, 16, "485: echo");
-    LCD_ShowString(10, 165, tftlcd_data.width, tftlcd_data.height, 16, "wifi: dump to uart1");
+    LCD_ShowString(10, 140, tftlcd_data.width, tftlcd_data.height, 16, "485: modbus");
+    LCD_ShowString(10, 165, tftlcd_data.width, tftlcd_data.height, 16, "wifi: mqtt");
 
-    /* ---------------- LVGL 移植层自检（阶段 1） ----------------
-     * 只做 lv_init + display/indev 注册，不建任何界面、不调 lv_timer_handler，
-     * 所以屏幕不会被 LVGL 接管，现有自检画面保持不动。
-     * 目的是把 LVGL 真正链接进来，验证代码能编、能初始化、并测出真实占用。
-     * 等 ui_task 里正式启用 LVGL 后，这一句可以删掉。 */
+    /* ---------------- LVGL 移植层初始化 ----------------
+     * lv_init + 显示 / indev 注册全工程只有这一处（ui_task 只调
+     * lv_timer_handler）。必须在起任务前完成：ui_task 一启动就要用
+     * 这些对象，注册晚了第一帧就会踩空。 */
     lv_port_init();
     printf("[lvgl] port init ok  v%d.%d.%d\r\n",
            LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);

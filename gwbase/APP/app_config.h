@@ -33,7 +33,7 @@
 #endif
 
 #ifndef BEMFA_HOST
-#define BEMFA_HOST       "mqtt.bemfa.com
+#define BEMFA_HOST       "mqtt.bemfa.com"
 #endif
 
 #ifndef BEMFA_PORT
@@ -68,9 +68,11 @@
  * V0.8 = V0.7 + 首页顶栏改显 RTC 实时时间（运行时长移到关于页）、
  * 关于页加「时间」行、OTA 弹窗背景渐变 + 面板阴影。
  * V0.9 = V0.8 + 联网 NTP 对时（UDP 直发 48 字节请求，不挑 ESP AT
- * 固件版本），抹掉"编译时刻"起点带来的固定偏差。 */
+ * 固件版本），抹掉"编译时刻"起点带来的固定偏差。
+ * V1.0 = V0.5~V0.9 全链路实机验收版：Modbus 采集 + Flash 存储 +
+ * MQTT 上报/补传 + RTC/NTP 时间戳 + OTA 升级/回滚 + 屏上配网。 */
 #ifndef APP_VERSION
-#define APP_VERSION      "V0.9"
+#define APP_VERSION      "V1.0"
 #endif
 
 /* Modbus RTU 主站：RS485 上挂的从站。

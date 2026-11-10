@@ -18,7 +18,7 @@
 
 typedef struct {
     uint32_t seq;        /* monotonic counter, the key for resuming after reboot */
-    uint32_t ts;         /* seconds since boot (RTC later)                      */
+    uint32_t ts;         /* Unix 秒：RTC/NTP 真实时间，RTC 降级时退回上电秒数 */
     int16_t  temp_x10;   /* temperature x10, 253 = 25.3 C                       */
     uint16_t humi_x10;   /* humidity x10,    450 = 45.0 %RH                     */
     uint8_t  valid;      /* 0 = sensor read failed this round                   */

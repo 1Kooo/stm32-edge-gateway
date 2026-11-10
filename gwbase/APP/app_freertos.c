@@ -132,12 +132,9 @@ static void ascii_to_buf(char *dst, uint16_t dst_size, const uint8_t *p, uint16_
 
 /* ================= LED 任务 ================= */
 void led_task(void *args);
-// 最小推荐填写128 => 128*4 = 512B
-#define LED_TASK_STACK_SIZE 256
-// 任务优先级 => 数值越小优先级越小 => 最大7 => 推荐使用最小优先级0
+#define LED_TASK_STACK_SIZE 256    /* 字（word），256*4 = 1KB */
 #define LED_TASK_PRIORITY   1
-// LED任务周期 500ms
-#define LED_TASK_PERIOD     500
+#define LED_TASK_PERIOD     500    /* ms */
 TaskHandle_t led_task_handle;
 
 /* ================= 心跳任务 ================= */
@@ -252,7 +249,7 @@ void beat_task(void *args)
     while (1)
     {
         sec++;
-        app_log("[beat] t=%lus heap=%u stack=%u wake=%lu\r\n",
+        app_log("[beat] t=%lus heap=%u stack=%u mb=%lu\r\n",
                 (unsigned long)sec,
                 (unsigned)xPortGetFreeHeapSize(),
                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
@@ -354,6 +351,8 @@ void uart_poll_task(void *args)
 #define MQTT_PING_IDLE_MS    10000u     /* 空闲这么久就发一次 PINGREQ */
 #define MQTT_PING_FAIL_MAX   3u         /* 连续几次收不到 PINGRESP 才判死 */
 
+#define NTP_TRY_MAX          5u         /* 对时最多试几次，再失败就用现有时间 */
+
 /* 日志区操作（定义在文件后面，这里先声明给 net_task 用） */
 static uint32_t log_pending(void);
 static int      log_peek_next(log_entry_t *e, uint32_t *addr);
@@ -366,7 +365,8 @@ static int      log_mark_sent(uint32_t addr);
 static wifi_cfg_t s_cfg_pending;
 static uint8_t    s_cfg_has_pending = 0;
 static uint8_t    s_wifi_fail = 0;      /* 连续关联失败次数，到达 3 次就回退 */
-static uint8_t    s_ntp_done  = 0;      /* 本次上电是否已对过时：只问一次，失败不重试 */
+static uint8_t    s_ntp_done  = 0;      /* 对时成功置 1，成功过就不再问 */
+static uint8_t    s_ntp_try   = 0;      /* 失败次数，够 NTP_TRY_MAX 次就放弃 */
 
 /* WiFi 扫描（UI 发起，net_task 执行）。
  * 串口 AT 机只有 net_task 在开，UI 任务只能隔着这几个变量提需求，
@@ -528,19 +528,23 @@ void net_task(void *args)
         s_wifi_fail = 0;                    /* 关联成功，失败计数清零 */
 
         /* 2.5 对时：刚拿到 IP，趁 MQTT 还没连，先问一次 NTP。
-         * RTC 没电池/首次上电时只有编译时刻，起点天然落后几分钟
-         * （编译到上板那段时间）；联网后拿真实时间写进 RTC 抹掉它。
-         * 每次上电只问一次：失败就用现有时间继续跑，不值得反复重试
-         * —— NTP 不可用多半是外网不通，MQTT 那条路也未必好。 */
-        if (s_ntp_done == 0u) {
+         * RTC 没电池/首次上电时只有编译时刻，起点天然落后几分钟。
+         * 失败不放弃、下一轮重连再问 —— 刚拿到 IP 时 DNS 常还没就绪，
+         * 一次失败就作废会让整个上电周期都停在编译时刻（实测踩过）。
+         * 上限 NTP_TRY_MAX 次：每次尝试都要拆一次 MQTT 的 TCP（见 net_if_ntp），
+         * NTP 端口被长期封死时每轮都拆会把链路拖垮。 */
+        if (s_ntp_done == 0u && s_ntp_try < NTP_TRY_MAX) {
             uint32_t ntp_ts;
 
-            s_ntp_done = 1u;
             if (net_if_ntp(&ntp_ts) == 0) {
                 app_log("[ntp] unix=%lu\r\n", (unsigned long)ntp_ts);
                 drv_rtc_set_unix(ntp_ts);
+                drv_rtc_mark_synced();      /* 从此这份时间可信，屏上可以显示 */
+                s_ntp_done = 1u;
             } else {
-                app_log("[ntp] sync FAIL, keep current time\r\n");
+                s_ntp_try++;
+                app_log("[ntp] sync FAIL (%u/%u), retry on next reconnect\r\n",
+                        (unsigned)s_ntp_try, (unsigned)NTP_TRY_MAX);
             }
         }
 
@@ -828,7 +832,9 @@ out:
 
 /* ---------------- 7.2 补传：net_task 侧的三个只读/标记操作 ---------------- */
 
-/* 积压量（含已标记的，用来判断该用正常节奏还是补传节奏） */
+/* 积压条数 = (wptr - rptr) 折算。正常运行 [rptr, wptr) 全是未发记录；
+ * 掉电刚恢复时可能短暂包含"已标记已发但 rptr 没来得及前进"的条目，
+ * 只会高估一点，用来选上报节奏足够了。 */
 static uint32_t log_pending(void)
 {
     uint32_t p;
