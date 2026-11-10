@@ -21,6 +21,7 @@
 #include "app_config.h"      /* APP_VERSION / WIFI_SSID / BEMFA_* */
 #include "app_wifi_cfg.h"    /* 配网凭据的存取 */
 #include "drv_rtc.h"         /* drv_rtc_unix / drv_rtc_split：顶栏实时时间 */
+#include "app_wdg.h"         /* app_wdg_kick：ui_task 心跳 */
 #include "app_ui.h"
 
 /* 日志函数定义在 app_freertos.c，全项目惯例：用到的文件自己 extern 一句 */
@@ -1057,7 +1058,7 @@ static void ui_build_about(lv_obj_t *scr)
     lv_label_set_text(s_ui_heap, "0 B");
 
     lb = ui_label(card, 14, 178, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(lb, "固件 V1.0 · 中文字库 1084 字形");
+    lv_label_set_text(lb, "固件 V1.2 · 中文字库 1084 字形");
 }
 
 static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连点 */
@@ -1217,6 +1218,8 @@ void ui_task(void *args)
     ui_create();
 
     while (1) {
+        app_wdg_kick(WDG_HB_UI);        /* 屏没冻住 = 这个任务还在转 */
+
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(5));
 

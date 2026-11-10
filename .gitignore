@@ -25,6 +25,9 @@ app_config_local.h
 # 本地修复日志，仅自己看，不入库
 修复日志/
 
+# 临时串口抓包日志（直接 dump 在仓库根目录）
+/1.txt
+
 # Python 工具缓存
 __pycache__/
 

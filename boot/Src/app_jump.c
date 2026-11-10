@@ -15,6 +15,22 @@
 #include "boot_uart.h"
 #include "stm32f4xx_hal.h"
 
+/* 复位原因快照：把 RCC->CSR 存进备份寄存器 BKP3R，APP 起来自己打印。
+ *
+ * 为什么非得由 boot 来存：下面 HAL_RCC_DeInit() 会把 CSR 里的复位标志清掉，
+ * APP 再去读就永远是一排 0 —— 之前"看门狗复位却显示 IWDG=0"就是这么来的，
+ * 连真断电后的 POR 都读成 0。
+ * 备份域由 VBAT/待机电路供电，跨复位和跨断电都保留，正好当这个信箱。 */
+static void save_reset_cause(void)
+{
+    /* 写备份寄存器要先开 PWR 时钟并解锁备份域 */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+
+    /* 只存复位相关的高 8 位（bit24~31：RMVF + 各路复位标志），低位是 LSI 状态 */
+    RTC->BKP3R = RCC->CSR & 0xFF000000u;
+}
+
 int app_jump_try(void)
 {
     uint32_t sp = *(volatile uint32_t *)APP_BASE;             /* 向量表第 0 项：栈顶 */
@@ -36,6 +52,9 @@ int app_jump_try(void)
 
     boot_printf("[boot] jump 0x%08X  sp=0x%08X pc=0x%08X\r\n",
                 (unsigned)APP_BASE, (unsigned)sp, (unsigned)pc_aligned);
+
+    /* 必须在 HAL_RCC_DeInit 之前：那一步会把 CSR 的复位标志清掉 */
+    save_reset_cause();
 
     HAL_DeInit();
     HAL_RCC_DeInit();

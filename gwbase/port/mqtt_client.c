@@ -5,10 +5,11 @@
  * 这里没有引任何 MQTT 库，全部按规范逐字节拼装。只依赖 net_if_send()
  * 往外送字节，所以本文件不知道 ESP-01S 存在，也不知道 AT 指令。
  *
- * 只实现"最小可用子集"（上报方向）：
- *   已实现：CONNECT / CONNACK 解析 / PUBLISH(QoS0) / PINGREQ
- *   未实现：SUBSCRIBE、QoS1/2、遗嘱消息、TLS、用户名密码
- * 少这些东西，代码量从"几十 KB"降到 ~1KB，对双区 OTA 的 flash 预算很关键。
+ * 只实现"够用就行"的子集：
+ *   上行：CONNECT / CONNACK 解析 / PUBLISH(QoS0) / PINGREQ
+ *   下行：SUBSCRIBE / SUBACK 解析 / PUBLISH 解析（云端改参数）
+ *   未实现：QoS1/2、遗嘱消息、TLS、用户名密码
+ * 少这些东西，代码量从"几十 KB"降到 ~2KB，对双区 OTA 的 flash 预算很关键。
  *
  * 报文通用结构（MQTT 3.1.1 第 2 章）：
  *
@@ -42,6 +43,21 @@
 
 static uint8_t  s_pkt[MQTT_PKT_MAX];
 static uint8_t  s_connected = 0;    /* 只有收到合法 CONNACK 才置 1 */
+
+/* ------------------------------------------------ 下行（云端 -> 设备）
+ * 透传模式下 broker 推来的字节和 PINGRESP 走同一条串口流，必须自己拆包。
+ * 认三种报文：PUBLISH(3) 取载荷当命令、SUBACK(9) / PINGRESP(13) 只置标志。
+ * 残包留在 s_rx 里等下一轮补齐 —— 一条下行报文往往一轮 10ms 收不全。 */
+#define RX_BUF   192u               /* 残包缓冲 */
+#define CMD_MAX  64u                /* 最近一条云命令 */
+
+static uint8_t  s_rx[RX_BUF];
+static uint16_t s_rxlen;
+static char     s_cmd[CMD_MAX];
+static uint16_t s_cmdlen;
+static uint8_t  s_cmd_new;          /* 1 = 有命令等调用方取走 */
+static uint8_t  s_got_suback;
+static uint8_t  s_got_pingresp;
 
 /* ------------------------------------------------------------- 编码辅助 */
 
@@ -90,6 +106,89 @@ static uint16_t enc_remlen(uint8_t *p, uint32_t len)
     } while (len > 0u);
 
     return n;
+}
+
+/* ------------------------------------------------------- 下行报文解析 */
+
+/**
+ * 从 s_rx 头部拆一个完整报文，返回消费掉的字节数。
+ *
+ * @return 0 = 还没收全，等下一轮；>0 = 已消费这么多字节
+ */
+static uint16_t parse_one(void)
+{
+    uint32_t remlen = 0u;
+    uint32_t mult   = 1u;
+    uint32_t plen;
+    uint16_t i      = 1u;
+    uint16_t hdr;
+    uint16_t tlen;
+    uint16_t n;
+    uint8_t  type;
+
+    if (s_rxlen < 2u) return 0u;
+
+    type = (uint8_t)(s_rx[0] >> 4);
+
+    /* 剩余长度是变长编码：每字节 7 位有效，最高位表示"后面还有" */
+    while (i < s_rxlen && i <= 4u) {
+        remlen += (uint32_t)(s_rx[i] & 0x7Fu) * mult;
+        mult *= 128u;
+        i++;
+        if ((s_rx[i - 1u] & 0x80u) == 0u) break;
+    }
+    if (i > 4u) return s_rxlen;                 /* 长度字段不合法，整段扔掉 */
+
+    hdr = i;                                    /* 可变头从这里开始 */
+    if ((uint32_t)s_rxlen < (uint32_t)hdr + remlen) return 0u;   /* 还没收全 */
+
+    if (type == 3u) {
+        /* PUBLISH：可变头是 topic（2 字节长度 + 名字），剩下才是载荷 */
+        if (remlen >= 4u) {
+            tlen = (uint16_t)(((uint16_t)s_rx[hdr] << 8) | s_rx[hdr + 1u]);
+            plen = remlen - 2u - (uint32_t)tlen;
+
+            if (plen > 0u) {
+                n = (plen > (CMD_MAX - 1u)) ? (CMD_MAX - 1u) : (uint16_t)plen;
+                memcpy(s_cmd, &s_rx[hdr + 2u + tlen], n);
+                s_cmd[n]  = '\0';
+                s_cmdlen  = n;
+                s_cmd_new = 1u;
+            }
+        }
+    } else if (type == 9u) {
+        s_got_suback = 1u;
+    } else if (type == 13u) {
+        s_got_pingresp = 1u;
+    }
+
+    return (uint16_t)(hdr + remlen);
+}
+
+/**
+ * 收一轮字节并尽量多解析几条报文。timeout_ms 传给 net_if_recv：
+ * 0/10 = 轮询，100 = 等应答时的小步长。
+ */
+static void rx_poll(uint32_t timeout_ms)
+{
+    uint16_t n;
+    uint16_t used;
+
+    n = net_if_recv(&s_rx[s_rxlen], (uint16_t)(RX_BUF - s_rxlen), timeout_ms);
+    s_rxlen = (uint16_t)(s_rxlen + n);
+
+    for (;;) {
+        used = parse_one();
+        if (used == 0u) break;
+        if (used > s_rxlen) used = s_rxlen;
+        if (used < s_rxlen) {
+            memmove(s_rx, &s_rx[used], (size_t)(s_rxlen - used));
+        }
+        s_rxlen = (uint16_t)(s_rxlen - used);
+    }
+
+    /* 缓冲塞满却拼不出完整报文 = 数据流已经错位，整段丢掉重来 */
+    if (s_rxlen >= RX_BUF) s_rxlen = 0u;
 }
 
 /* ------------------------------------------------------------------ API */
@@ -188,6 +287,35 @@ int mqtt_publish(const char *topic, const uint8_t *payload, uint16_t len)
     return (net_if_send(s_pkt, i) == 0) ? 0 : -3;
 }
 
+int mqtt_subscribe(const char *topic)
+{
+    uint16_t tlen, remlen, i = 0;
+    uint8_t  try;
+
+    if (!s_connected || topic == NULL || topic[0] == '\0') return -1;
+
+    tlen   = (uint16_t)strlen(topic);
+    remlen = (uint16_t)(2u + 2u + tlen + 1u);    /* 报文ID(2) + topic + QoS(1) */
+
+    /* SUBSCRIBE 固定头低 4 位规范规定必须是 0010，所以是 0x82 不是 0x80 */
+    s_pkt[i++] = 0x82u;
+    i = (uint16_t)(i + enc_remlen(&s_pkt[i], remlen));
+    s_pkt[i++] = 0x00u;                          /* 报文 ID 固定 1（只订一次） */
+    s_pkt[i++] = 0x01u;
+    i = (uint16_t)(i + put_str(&s_pkt[i], topic));
+    s_pkt[i++] = 0x00u;                          /* 请求 QoS0，和我们发布保持一致 */
+
+    s_got_suback = 0u;
+    if (net_if_send(s_pkt, i) != 0) return -2;
+
+    /* 20 × 100ms ≈ 2 秒。不等 SUBACK 也能收下行（broker 通常会直接推），
+     * 但等一等能立刻看出"订阅有没有被拒"，省得后面一堆猜。 */
+    for (try = 0; try < 20u && !s_got_suback; try++) {
+        rx_poll(100u);
+    }
+    return (s_got_suback != 0u) ? 0 : -3;
+}
+
 /**
  * 心跳 PINGREQ + 等 PINGRESP，2 个字节：0xC0（类型 12 << 4，标志 0）+ 剩余长度 0。
  * 应答是 0xD0 0x00（类型 13 << 4）。
@@ -219,23 +347,43 @@ int mqtt_publish(const char *topic, const uint8_t *payload, uint16_t len)
  */
 int mqtt_ping(void)
 {
-    uint8_t  rx[2];
-    uint16_t got;
+    uint8_t try;
 
     if (!s_connected) return -1;
 
-    net_if_flush_rx();                                      /* 1. 清脏数据 */
+    s_got_pingresp = 0u;
 
     s_pkt[0] = 0xC0u;                                       /* 2. 发 PINGREQ */
     s_pkt[1] = 0x00u;                                       /*    剩余长度 0 */
     if (net_if_send(s_pkt, 2u) != 0) return -2;
 
-    got = net_if_recv(rx, 2u, MQTT_PING_TIMEOUT_MS);        /* 3. 等 PINGRESP */
-    if (got == 0u)          return -3;                      /*    超时，没回音 */
-    if (got < 2u)           return -4;                      /*    只来半个包 */
-    if (rx[0] != 0xD0u || rx[1] != 0x00u) return -4;        /*    不是 PINGRESP */
+    /* 3. 20 × 100ms ≈ 2 秒等 PINGRESP。
+     * 原来是一把 flush 再直接读 2 字节，撞上 broker 正在推下行就误判；
+     * 现在走同一个解析器，下行报文被顺手消化掉，PINGRESP 照样能认出来。 */
+    for (try = 0; try < 20u && !s_got_pingresp; try++) {
+        rx_poll(100u);
+    }
 
-    return 0;
+    return (s_got_pingresp != 0u) ? 0 : -3;
+}
+
+int mqtt_pump(char *out, uint16_t max, uint16_t *len)
+{
+    uint16_t n;
+
+    if (out == NULL || len == NULL || max == 0u) return 0;
+
+    rx_poll(10u);                   /* 有就取走，没有就最多等 10ms */
+
+    if (s_cmd_new == 0u) return 0;
+
+    n = (s_cmdlen < (uint16_t)(max - 1u)) ? s_cmdlen : (uint16_t)(max - 1u);
+    memcpy(out, s_cmd, n);
+    out[n] = '\0';
+    *len   = n;
+
+    s_cmd_new = 0u;
+    return 1;
 }
 
 /**
@@ -245,6 +393,10 @@ int mqtt_ping(void)
 void mqtt_reset(void)
 {
     s_connected = 0;
+    s_rxlen     = 0u;       /* 断链后残包作废：QoS0 的报文 broker 不会补发 */
+    s_cmd_new   = 0u;
+    s_got_suback   = 0u;
+    s_got_pingresp = 0u;
 }
 
 int mqtt_is_connected(void)

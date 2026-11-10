@@ -21,6 +21,7 @@
 #include "net_if.h"
 #include "drv_uart.h"
 #include "app_config.h"
+#include "app_wdg.h"        /* app_wdg_kick：NTP/重连这类长阻塞里给 net_task 打心跳 */
 #include "bsp_pinmap.h"
 
 #define AT_LINE_MAX      128u
@@ -417,7 +418,10 @@ int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
         strcat(cmd, "\",\"");
         cmd_append_escaped(cmd, (uint16_t)sizeof(cmd), s_pass);
         strcat(cmd, "\"");
+        /* CWJAP 最坏要等 15 秒才超时，前后都打点，免得被看门狗当成停滞 */
+        app_wdg_kick(WDG_HB_NET);
         r = at_send_wait(cmd, "WIFI GOT IP", 15000);
+        app_wdg_kick(WDG_HB_NET);
         if (r != AT_OK) { s_state = NET_DOWN; return -3; }
     }
 
@@ -432,6 +436,8 @@ int net_if_connect(const char *host, uint16_t port, uint32_t timeout_ms)
     s_last_port = port;
 
     for (i = 0; i < 3; i++) {
+        /* 三次重试最坏 3×(8+3+1.5) ≈ 37 秒，每次进来打一次点 */
+        app_wdg_kick(WDG_HB_NET);
         snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u", host, (unsigned)port);
         /* 只用 "CONNECT" 匹配是安全的：at_send_wait 已经在匹配前把
          * "ALREADY CONNECTED" 拦成 AT_ERROR，不会被它糊弄过去。 */
@@ -552,6 +558,10 @@ int net_if_ntp(uint32_t *out_ts)
     for (si = 0; si < 2 && ret != 0; si++) {
         char cmd[80];
 
+        /* 一次 NTP 尝试最坏要 20 秒（连接 8 + 发送 3 + 收包 6 + 关闭 3），
+         * 两次加起来会越过看门狗的停滞窗口，所以每轮都打个点。 */
+        app_wdg_kick(WDG_HB_NET);
+
         /* UDP 连 NTP 服务器，域名由 ESP 固件自己解析（CIPSTART 支持 DNS） */
         snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"UDP\",\"%s\",123", k_servers[si]);
         r = at_send_wait(cmd, "CONNECT", 8000);
@@ -629,6 +639,8 @@ int net_if_ntp(uint32_t *out_ts)
 
         r = AT_ERROR;
         for (i = 0; i < 3; i++) {
+            app_wdg_kick(WDG_HB_NET);   /* 三次重试最坏 30 秒，同样要打点 */
+
             snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u",
                      s_last_host, (unsigned)s_last_port);
             r = at_send_wait(cmd, "CONNECT", 8000);

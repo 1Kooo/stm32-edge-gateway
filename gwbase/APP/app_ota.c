@@ -27,6 +27,7 @@
 #include "app_ota.h"
 #include "app_ota_flag.h"
 #include "app_config.h"
+#include "app_wdg.h"        /* 下载期间给 net_task 打心跳，别被看门狗误判 */
 #include "drv_spiflash.h"
 #include "net_if.h"
 #include "stm32f4xx_hal.h"
@@ -284,6 +285,7 @@ int app_ota_run(void)
     app_log("[ota] erasing %lu sectors ...\r\n", (unsigned long)sectors);
 
     for (i = 0; i < sectors; i++) {
+        app_wdg_kick(WDG_HB_NET);       /* 擦除总耗时 3~10 秒，必须打点 */
         r = drv_flash_erase_sector(FW_STAGE_BASE + i * FLASH_SECTOR_SIZE);
         if (r != 0) {
             app_log("[ota] erase FAIL at sector %lu (addr 0x%06lX)\r\n",
@@ -310,6 +312,10 @@ int app_ota_run(void)
     app_log("[ota] downloading %lu chunks ...\r\n", (unsigned long)chunk_cnt);
 
     for (i = 0; i < chunk_cnt; i++) {
+        /* 整个下载在这里一口气跑完（实测 60 秒上下），
+         * 不打点的话 wdg_task 会把这当成 net_task 停滞，装到一半就被复位。 */
+        app_wdg_kick(WDG_HB_NET);
+
         off = i * OTA_CHUNK;
         len = (uint16_t)((hdr.fw_len - off) > OTA_CHUNK
                          ? OTA_CHUNK : (hdr.fw_len - off));

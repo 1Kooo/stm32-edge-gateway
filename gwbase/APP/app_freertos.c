@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>         /* strtoul：解析云端下行命令里的数值 */
 #include <string.h>
 
 #include "stm32f4xx_hal.h"
@@ -31,6 +32,7 @@
 #include "app_config.h"
 #include "app_ui.h"         /* ui_task 入口 + ui_snapshot_t + 显示数据 getter */
 #include "app_wifi_cfg.h"   /* 屏上配的 WiFi 凭据：待写缓冲 + 落盘 */
+#include "app_wdg.h"        /* 看门狗心跳槽位定义 */
 
 /* ================= 断言与内核钩子 ================= */
 void app_assert_failed(const char *file, int line)
@@ -148,7 +150,10 @@ TaskHandle_t beat_task_handle;
 void uart_poll_task(void *args);
 #define UART_TASK_STACK_SIZE 512
 #define UART_TASK_PRIORITY   2
-#define MB_POLL_PERIOD_MS    2000u      /* 固定 2 秒一轮：从站最快 1Hz 出数，够用又不占总线 */
+/* 轮询周期改成变量：云端可以通过 MQTT 下行改它（见 cmd_apply） */
+static volatile uint32_t s_mb_period_ms = 2000u;
+#define MB_PERIOD_MIN_MS     500u       /* 再快就把 485 总线打爆了 */
+#define MB_PERIOD_MAX_MS     60000u
 TaskHandle_t uart_task_handle;
 
 /* 读数合理性闸门（HZ8706 标称 -40~80℃ / 0~100%RH，寄存器单位 0.1）：
@@ -187,6 +192,37 @@ void net_task(void *args);
 #define NET_TASK_PRIORITY    2
 TaskHandle_t net_task_handle;
 
+/* ================= 看门狗任务 =================
+ * IWDG 用 LSI 自己计数，CPU 卡死在 while(1) 里也照走，是"任务级死锁"唯一的
+ * 兜底手段（LVGL 断言就是这种死法：屏冻住，beat/net 却照常跳）。
+ *
+ * 喂不喂狗由心跳决定，不是无条件喂：
+ *   每个业务任务在自己循环体顶部打一次时间戳（app_wdg_kick），
+ *   wdg_task 每 WDG_FEED_MS 检查一遍，五个都在 WDG_STALL_MS 内推进过才喂。
+ *   任一任务停滞就停止喂，等硬件计数器耗尽把整机复位。
+ *
+ * IWDG 超时 ≈ 30 秒（LSI 32.768kHz / 分频 256 / 重装 3840），以下是硬件上限：
+ * 分频最大 256、重装值 12 位，想再长也长不了。
+ * 窗口 20s 不是随便取的：net_task 断网重连会睡 10 秒，窗口必须大于它，
+ * 否则正常工况下就会被误判停滞、反复自复位。 */
+#define WDG_ENABLE       1              /* 调试期改 0 可整体关掉（IWDG 启动后关不掉） */
+#define WDG_FEED_MS      5000u          /* 检查 + 喂狗周期 */
+#define WDG_STALL_MS     20000u         /* 某任务超过这么久没推进 → 判停滞 */
+
+/* 每个任务最后一次推进的时刻（HAL_GetTick）。32 位对齐写，M4 上单指令完成，
+ * 不需要临界区就能让 wdg_task 安全读。槽位定义在 app_wdg.h。 */
+static volatile uint32_t s_hb_tick[WDG_HB_NUM];
+
+void app_wdg_kick(uint8_t id)
+{
+    if (id < WDG_HB_NUM) s_hb_tick[id] = HAL_GetTick();
+}
+
+void wdg_task(void *args);
+#define WDG_TASK_STACK_SIZE  128
+#define WDG_TASK_PRIORITY    0          /* 最低优先级：只在别人都不跑时检查 */
+TaskHandle_t wdg_task_handle;
+
 /* ================= 创建 + 启动 ================= */
 void App_freeRTOS_start(void)
 {
@@ -207,6 +243,9 @@ void App_freeRTOS_start(void)
     xTaskCreate(beat_task,      "beat_task", BEAT_TASK_STACK_SIZE,
                 NULL, BEAT_TASK_PRIORITY, &beat_task_handle);
 
+    xTaskCreate(wdg_task,       "wdg_task",  WDG_TASK_STACK_SIZE,
+                NULL, WDG_TASK_PRIORITY,  &wdg_task_handle);
+
     xTaskCreate(uart_poll_task, "uart_task", UART_TASK_STACK_SIZE,
                 NULL, UART_TASK_PRIORITY, &uart_task_handle);
 
@@ -222,7 +261,7 @@ void App_freeRTOS_start(void)
     xTaskCreate(net_task,       "net",       NET_TASK_STACK_SIZE,
                 NULL, NET_TASK_PRIORITY, &net_task_handle);
 
-    printf("[rtos] 7 tasks created, starting scheduler\r\n");
+    printf("[rtos] 8 tasks created, starting scheduler\r\n");
 
     vTaskStartScheduler();          /* 不返回 */
 
@@ -258,6 +297,57 @@ void beat_task(void *args)
     }
 }
 
+/* 看门狗任务：先把 IWDG 跑起来，再每 5 秒查一轮心跳。
+ * 判据是"每个任务各自最后一次推进距今多久"，而不是"总共发生了几次" ——
+ * 计数法分不清是谁没来，ui_task 十毫秒一圈就够把计数刷满。 */
+void wdg_task(void *args)
+{
+#if WDG_ENABLE
+    IWDG_HandleTypeDef hiwdg;
+    uint8_t  i;
+    uint8_t  ok;
+    uint8_t  stall_id = 0;
+    uint8_t  reported = 0;      /* 同一次停滞只报一行，别刷爆串口 */
+
+    hiwdg.Instance       = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    hiwdg.Init.Reload    = 3840u;   /* 3840 × 256 / 32768 ≈ 30 秒 */
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+        app_log("[wdg] IWDG init FAIL, no protection\r\n");
+        vTaskDelete(NULL);          /* 没有看门狗也别占着任务 */
+        return;
+    }
+    app_log("[wdg] on, timeout ~30s, stall window %us\r\n",
+            (unsigned)(WDG_STALL_MS / 1000u));
+#endif
+
+    (void)args;
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(WDG_FEED_MS));
+
+#if WDG_ENABLE
+        ok = 1;
+        for (i = 0; i < WDG_HB_NUM; i++) {
+            if ((HAL_GetTick() - s_hb_tick[i]) >= WDG_STALL_MS) {
+                ok       = 0;
+                stall_id = i;
+            }
+        }
+
+        if (ok) {
+            HAL_IWDG_Refresh(&hiwdg);
+            reported = 0;
+        } else if (reported == 0u) {
+            /* 先报再等死：复位后串口能直接告诉你哪个任务卡了 */
+            reported = 1;
+            app_log("[wdg] STALL id=%u, stop feeding\r\n", (unsigned)stall_id);
+        }
+#endif
+    }
+}
+
 /* 485 走阻塞轮询：modbus_read_regs 自己等帧 + 校验，不需要中断唤醒。
  * 原来挂 rx_callback 去 vTaskNotifyGiveFromISR，任务会被自己刚收到的响应
  * 立刻叫醒（pdTRUE 只清计数，不判断是谁发的），2 秒节流形同虚设。 */
@@ -273,6 +363,8 @@ void uart_poll_task(void *args)
 
     while (1)
     {
+        app_wdg_kick(WDG_HB_UART);      /* 一轮开始 = 这个任务推进过了 */
+
         /* 从站偶尔丢一帧很正常（总线干扰 / 上电还没就绪），
          * 连续 3 次都失败才认输，避免云端看到一串断点。 */
         r = MODBUS_ERR_TIMEOUT;
@@ -337,12 +429,22 @@ void uart_poll_task(void *args)
 
         /* 固定 2 秒一轮。轮询自带 200ms 超时，不再需要"串口有数据就提前醒"，
          * 否则收到的每个字节都会把任务从睡眠里拽出来一次。 */
-        vTaskDelay(pdMS_TO_TICKS(MB_POLL_PERIOD_MS));
+        /* 先读一次到局部再延时：volatile 变量两次读之间可能被云端改掉，
+         * 那样算出来的周期会对不上 */
+        {
+            uint32_t period = s_mb_period_ms;
+
+            vTaskDelay(pdMS_TO_TICKS(period));
+        }
     }
 }
 
 /* ================= 网络：AT -> TCP -> MQTT ================= */
-#define MQTT_PUB_PERIOD_MS   2000u      /* 正常节奏：和采样同速，稳态不积压 */
+/* 上报周期也是变量：云端可改。默认和采样同速，稳态不积压 */
+static volatile uint32_t s_pub_period_ms = 2000u;
+#define PUB_PERIOD_MIN_MS    1000u
+#define PUB_PERIOD_MAX_MS    3600000u   /* 上限一小时，防止手滑写成天文数字 */
+#define CMD_PARAM_MAX        64u        /* 云命令文本上限 */
 #define MQTT_CATCHUP_MS      200u       /* 补传节奏：轮与轮之间的间隔 */
 #define MQTT_CATCHUP_GAP_MS  200u       /* 一轮内每条之间的间隔 */
 #define MQTT_CATCHUP_MAX     5u         /* 一轮最多补几条；一轮约 1 秒 */
@@ -394,16 +496,78 @@ static void scan_service(void)
     app_log("[wifi] scan done: %d\r\n", s_scan_cnt);
 }
 
+/* 云端下发命令：{"mb":5000,"pub":10000}，两个键都可选，单位毫秒。
+ *
+ * 只认这两个键，其余一概不动 —— 我们自己上报的 JSON（ts/temp/humi/seq）
+ * 万一被 broker 回推过来，也不会误触发。
+ * 改动只落在 RAM：断电回到编译默认值，要断电保留得等参数区那一期。 */
+static void cmd_apply(const char *s, uint16_t len)
+{
+    char    *p;
+    uint32_t v;
+    uint8_t  hit = 0;
+    char     buf[CMD_PARAM_MAX];
+
+    if (len == 0u || len >= (uint16_t)sizeof(buf)) {
+        app_log("[cmd] ignore len=%u\r\n", (unsigned)len);
+        return;
+    }
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+
+    /* 巴法云会把设备自己上报的报文回推一份，里面的 ts/temp/humi 不是命令。
+     * 认出来直接静默丢掉 —— 否则每上报一条就回一行日志，2 秒一次把串口塞满，
+     * 连心跳应答都挤不进来（实测出现过 ping FAIL）。
+     * 判据用"同时含 ts 和 seq"，比"以 { 开头"更准：真发命令时不会带这两个键。 */
+    if (strstr(buf, "\"ts\"") != NULL && strstr(buf, "\"seq\"") != NULL) {
+        return;
+    }
+
+    /* 定位值要用 strchr 找冒号，不能手数偏移：带引号的 "mb" 是 4 个字符，
+     * p+4 正好落在 ':' 上，strtoul(":2000") 返回 0，再被钳位兜成最小值 —— 踩过。 */
+    p = strstr(buf, "\"mb\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            v = (uint32_t)strtoul(p + 1, NULL, 10);
+            if (v < MB_PERIOD_MIN_MS) v = MB_PERIOD_MIN_MS;
+            if (v > MB_PERIOD_MAX_MS) v = MB_PERIOD_MAX_MS;
+            s_mb_period_ms = v;
+            hit = 1u;
+        }
+    }
+
+    p = strstr(buf, "\"pub\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            v = (uint32_t)strtoul(p + 1, NULL, 10);
+            if (v < PUB_PERIOD_MIN_MS) v = PUB_PERIOD_MIN_MS;
+            if (v > PUB_PERIOD_MAX_MS) v = PUB_PERIOD_MAX_MS;
+            s_pub_period_ms = v;
+            hit = 1u;
+        }
+    }
+
+    if (hit == 0u) {
+        app_log("[cmd] no known key: %s\r\n", buf);   /* 回显原样，方便对格式 */
+        return;
+    }
+    app_log("[cmd] mb=%lu pub=%lu applied\r\n",
+            (unsigned long)s_mb_period_ms, (unsigned long)s_pub_period_ms);
+}
+
 void net_task(void *args)
 {
     int           r;
-    uint16_t      n;
+    uint16_t      n;                    /* 连接失败时抓残留输出用 */
     char          line[96];
     char          topic[40];
     char          payload[96];
     char          tbuf[12];
     char          hbuf[12];
-    uint8_t       rx[16];
+    char          cmd[CMD_PARAM_MAX];   /* 云端下行命令文本 */
+    uint16_t      cmd_len;
     uint32_t      last_ping;
     uint32_t      backlog;
     uint32_t      budget;
@@ -419,6 +583,8 @@ void net_task(void *args)
 
     for (;;)
     {
+        app_wdg_kick(WDG_HB_NET);
+
         /* 0. OTA 请求优先处理。
          *
          * OTA 要独占 USART3 那一条 TCP 链路，而 MQTT 正占着它，所以必须
@@ -558,6 +724,13 @@ void net_task(void *args)
         }
         app_log("[mqtt] connected, publish -> %s\r\n", topic);
 
+        /* 订阅同一个主题：云端往这个主题发消息，broker 就推给我们。
+         * 订阅失败不影响上行，只记一行 —— 下次断线重连会再走一遍 CONNECT+SUBSCRIBE。 */
+        r = mqtt_subscribe(topic);
+        if (r != 0) {
+            app_log("[mqtt] SUBSCRIBE FAIL (%d), downlink unavailable\r\n", r);
+        }
+
         s_mqtt_up = 1;
         last_ping = HAL_GetTick();
         ping_fail = 0;                  /* 新链路，心跳计数从零开始 */
@@ -671,9 +844,11 @@ void net_task(void *args)
                 }
             }
 
-            /* 把 PINGRESP 之类的字节读掉，别让环形缓冲长期堆积 */
-            n = net_if_recv(rx, (uint16_t)sizeof(rx), 10);
-            (void)n;
+            /* 取云端下行命令（顺带把 PINGRESP 等字节消化掉，别让串口缓冲堆积）。
+             * 以前这里只是把字节读出来扔掉，云端发什么都石沉大海。 */
+            if (mqtt_pump(cmd, (uint16_t)sizeof(cmd), &cmd_len)) {
+                cmd_apply(cmd, cmd_len);    /* 就在 net_task 里改，不用再转发 */
+            }
 
             if ((HAL_GetTick() - last_ping) >= MQTT_PING_IDLE_MS) {
                 last_ping = HAL_GetTick();
@@ -695,6 +870,8 @@ void net_task(void *args)
                 }
             }
 
+            app_wdg_kick(WDG_HB_NET);       /* 内层每转一圈也算推进 */
+
             /* 积压时快跑追平，追平后回到正常节奏。
              * 扣掉本轮已耗时间：否则周期 = 发送耗时 + 固定延时 > 采样周期，
              * 会缓慢积压，每隔一阵子冒一次 catch-up。
@@ -702,7 +879,7 @@ void net_task(void *args)
              * 否则 backlog 一直涨会按 200ms 空转。 */
             {
                 uint32_t period = (ping_fail == 0 && backlog > MQTT_BACKLOG_MARK)
-                                  ? MQTT_CATCHUP_MS : MQTT_PUB_PERIOD_MS;
+                                  ? MQTT_CATCHUP_MS : s_pub_period_ms;
                 uint32_t used   = (uint32_t)(xTaskGetTickCount() - t_start);
 
                 vTaskDelay(pdMS_TO_TICKS((used < period) ? (period - used) : 1u));
@@ -746,6 +923,9 @@ static int log_store_init(void)
     s_log_full = 1;
 
     while (addr < LOG_END) {
+        /* 日志区写满时这里要通读 3MB，量级到十秒，中途打点免得被当成停滞 */
+        app_wdg_kick(WDG_HB_STORE);
+
         n = LOG_END - addr;
         if (n > LOG_SCAN_CHUNK) n = LOG_SCAN_CHUNK;
 
@@ -923,6 +1103,8 @@ void storage_task(void *args)
 
     while (1)
     {
+        app_wdg_kick(WDG_HB_STORE);
+
         /* OTA 正在往外部 Flash 写固件，这里必须让路。
          *
          * 两个任务优先级相同（都是 2），FreeRTOS 按时间片轮转，本任务随时
@@ -936,7 +1118,10 @@ void storage_task(void *args)
             continue;
         }
 
-        if (xQueueReceive(s_data_queue, &rec, portMAX_DELAY) != pdTRUE) {
+        /* 队列空时不能无限期阻塞：心跳会跟着停，20 秒后就被判成停滞。
+         * 改成 5 秒超时醒来打一次卡，语义不变（没数据就是没事干）。 */
+        if (xQueueReceive(s_data_queue, &rec, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            app_wdg_kick(WDG_HB_STORE);
             continue;
         }
 
@@ -978,6 +1163,8 @@ void sample_task(void *args)
 
     while (1)
     {
+        app_wdg_kick(WDG_HB_SAMPLE);
+
         /* 取走 uart_poll_task 这一轮的结果。清零也在临界区里，
          * 否则两次采样之间可能把同一轮读数记录两遍。 */
         taskENTER_CRITICAL();

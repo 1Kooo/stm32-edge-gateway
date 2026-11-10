@@ -70,9 +70,13 @@
  * V0.9 = V0.8 + 联网 NTP 对时（UDP 直发 48 字节请求，不挑 ESP AT
  * 固件版本），抹掉"编译时刻"起点带来的固定偏差。
  * V1.0 = V0.5~V0.9 全链路实机验收版：Modbus 采集 + Flash 存储 +
- * MQTT 上报/补传 + RTC/NTP 时间戳 + OTA 升级/回滚 + 屏上配网。 */
+ * MQTT 上报/补传 + RTC/NTP 时间戳 + OTA 升级/回滚 + 屏上配网。
+ * V1.1 = V1.0 + 时间可信度显示（未校准显示 --:--）+ 独立看门狗
+ * （心跳门控喂狗：五个任务都推进才喂，任一停滞由 IWDG 复位）。
+ * V1.2 = V1.1 + MQTT 下行：订阅主题、解析云端 PUBLISH，可在线改
+ * 485 轮询周期与上报周期（RAM 生效，断电回默认）。 */
 #ifndef APP_VERSION
-#define APP_VERSION      "V1.0"
+#define APP_VERSION      "V1.2"
 #endif
 
 /* Modbus RTU 主站：RS485 上挂的从站。
