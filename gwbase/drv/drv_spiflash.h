@@ -20,7 +20,8 @@
 #define FLASH_TOTAL_SIZE     (16u * 1024u * 1024u)
 
 /* JEDEC id is 24 bit: manufacturer | memory type | capacity.
- * Winbond / EON SPI NOR always reports 0xEF40xx; the last byte is capacity:
+ * Winbond SPI NOR reports 0xEF40xx (EON/GigaDevice use other mfr ids: 0x1C / 0xC8).
+ * This board reports 0xEF4018 = Winbond W25Q128 (16MB). Last byte is capacity:
  *   0xEF4016 = 4MB, 0xEF4017 = 8MB, 0xEF4018 = 16MB
  */
 #define FLASH_EXPECTED_MFR   0xEFu

@@ -42,7 +42,9 @@ typedef struct {
     uint32_t crc;           /* 上面所有字段的 CRC32（本字段不参与计算） */
 } ota_flag_t;               /* 40 字节 */
 
-/* 标准 CRC32（多项式 0x04C11DB7，初值 0xFFFFFFFF，末尾取反） */
+/* CRC-32/BZIP2（多项式 0x04C11DB7、初值 0xFFFFFFFF、MSB first 不反射、
+ * 末尾整体取反）。注意它和 zlib 那种"标准 CRC32"结果不同：
+ * 两端必须用同一套实现，PC 侧对应 tools/ota_crc.py。 */
 uint32_t ota_crc32(const void *data, uint32_t len);
 
 /* 增量式三段接口，分块数据的 CRC 必须用它（如 400KB 固件校验）：

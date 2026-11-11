@@ -14,7 +14,8 @@
 #include "system.h"
 
 /* ============ 端口占用速查（改任何引脚前先看这张表）============
- * PA0  KEY_UP          PA2/PA3   USART2 (485)      PA5/PA6/PA7  LCD FSMC
+ * PA0  KEY_UP          PA2/PA3   USART2 (485)      PA5/PA6/PA7  未使用（SPI1 的引脚，
+ *                                                       与 Flash 共用总线，未单独占用）
  * PA9/PA10 USART1      PA11/PA12 USB               PA13/PA14    SWD
  *
  * PB0  TP_SCK   PB1 TP_PEN   PB2 TP_MISO   PB3/PB4/PB5 SPI1(Flash)
@@ -25,6 +26,7 @@
  *
  * PE2/PE3/PE4 KEY0-2   PF6 ESP_RST   PF9/PF10 LED    PG8 RS485_DE
  * PG9  DHT11           PD/PE/PF/PG 其余多数被 FSMC(屏+SRAM) 占用
+ *                      （F407 的 FSMC 只在这些端口上，PA 没有 FSMC 复用）
  * ================================================================ */
 
 /* =========================================================
@@ -70,7 +72,7 @@
 #define PIN_ESP_EN_PIN          GPIO_PIN_0
 
 /* =========================================================
- *  SPI1 + external flash (EN25Q128, 16MB)
+ *  SPI1 + external flash (W25Q128, 16MB)
  * ========================================================= */
 #define PIN_SPI1_INSTANCE       SPI1
 #define PIN_SPI1_SCK_PORT       GPIOB

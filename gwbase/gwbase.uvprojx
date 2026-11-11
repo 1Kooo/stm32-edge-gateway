@@ -596,6 +596,16 @@
               <FilePath>.\app\app_ota.h</FilePath>
             </File>
             <File>
+              <FileName>app_event.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_event.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_event.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_event.h</FilePath>
+            </File>
+            <File>
               <FileName>app_param.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\app\app_param.c</FilePath>

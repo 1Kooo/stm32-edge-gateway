@@ -558,6 +558,16 @@ int net_if_ntp(uint32_t *out_ts)
     for (si = 0; si < 2 && ret != 0; si++) {
         char cmd[80];
 
+        /* 每台服务器都从干净状态开始。done/stage/match/len/rxn 定义在循环外，
+         * 上一台"连上了但没等到包"时会停在半路（比如 stage 已经进到 2、
+         * rxn 收了一半），第二台如果接着用这堆残留，要么立刻拿半包字节算时间，
+         * 要么因为 stage 不在 0 而认不出 "+IPD," 直接超时 —— 双服务器等于白配。 */
+        done  = 0;
+        stage = 0;
+        match = 0;
+        rxn   = 0;
+        len   = 0;
+
         /* 一次 NTP 尝试最坏要 20 秒（连接 8 + 发送 3 + 收包 6 + 关闭 3），
          * 两次加起来会越过看门狗的停滞窗口，所以每轮都打个点。 */
         app_wdg_kick(WDG_HB_NET);
@@ -639,7 +649,7 @@ int net_if_ntp(uint32_t *out_ts)
 
         r = AT_ERROR;
         for (i = 0; i < 3; i++) {
-            app_wdg_kick(WDG_HB_NET);   /* 三次重试最坏 30 秒，同样要打点 */
+            app_wdg_kick(WDG_HB_NET);   /* 三次重试最坏 3×(8+3+1.5)≈37 秒，必须打点 */
 
             snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u",
                      s_last_host, (unsigned)s_last_port);

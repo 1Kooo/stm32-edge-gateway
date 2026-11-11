@@ -69,12 +69,12 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-    #define LV_MEM_SIZE (48 * 1024U)          /**< [bytes] 48KB: popup draw needs more than 24KB */   //�ڴ�������64K
+    #define LV_MEM_SIZE (56 * 1024U)          /**< [bytes] 56KB: popup + event page + WiFi scan list peak needs more than 48KB (was 24KB, then 48KB) */
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0
 
-    //��lvgl �����ڴ�ռ�ŵ��ⲿSRAM�Ļ������Ը����#define LV_MEM_ADR 0   Can be in external SRAM too
+    // LVGL heap is a plain .bss array by default; set LV_MEM_ADR to place it elsewhere (e.g. external SRAM).
     
     /** Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too. */
     #define LV_MEM_ADR 0     /**< 0: unused*/

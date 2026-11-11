@@ -49,7 +49,7 @@ static uint8_t  s_connected = 0;    /* 只有收到合法 CONNACK 才置 1 */
  * 认三种报文：PUBLISH(3) 取载荷当命令、SUBACK(9) / PINGRESP(13) 只置标志。
  * 残包留在 s_rx 里等下一轮补齐 —— 一条下行报文往往一轮 10ms 收不全。 */
 #define RX_BUF   192u               /* 残包缓冲 */
-#define CMD_MAX  64u                /* 最近一条云命令 */
+#define CMD_MAX  128u               /* 最近一条云命令（要跟 app_freertos.c 的 CMD_PARAM_MAX 一致） */
 
 static uint8_t  s_rx[RX_BUF];
 static uint16_t s_rxlen;
@@ -140,20 +140,58 @@ static uint16_t parse_one(void)
     if (i > 4u) return s_rxlen;                 /* 长度字段不合法，整段扔掉 */
 
     hdr = i;                                    /* 可变头从这里开始 */
+
+    /* 剩余长度上限：超过缓冲区容量的报文不可能是给我们的，
+     * 一定是流已经错位了（错位后 remlen 是随机字节，可能是个天文数字，
+     * 那样报文会被永远判成"还没收全"，把后面所有正常报文都堵死 ——
+     * ping FAIL 连三次就是这么来的）。立刻整段丢弃，从头对齐。 */
+    if (remlen > (uint32_t)(RX_BUF - 8u)) return s_rxlen;
+
     if ((uint32_t)s_rxlen < (uint32_t)hdr + remlen) return 0u;   /* 还没收全 */
 
     if (type == 3u) {
         /* PUBLISH：可变头是 topic（2 字节长度 + 名字），剩下才是载荷 */
-        if (remlen >= 4u) {
+        if (remlen >= 2u) {
             tlen = (uint16_t)(((uint16_t)s_rx[hdr] << 8) | s_rx[hdr + 1u]);
+
+            /* topic 长度必须落在剩余长度之内。少这一句就会出现：
+             *   plen = remlen - 2 - tlen  在无符号数里下溢成 ~4G，
+             *   接着 memcpy 从 s_rx 之外读 63 字节进 s_cmd，
+             *   串口上打出一屏乱码（实测踩过：[cmd] no known key: ゥゥゥ...）。 */
+            if (tlen > (uint16_t)(remlen - 2u)) return s_rxlen;
+
             plen = remlen - 2u - (uint32_t)tlen;
 
+            /* 越界再兜一道：可变头 + topic + 载荷不能超出已收字节 */
+            if ((uint32_t)hdr + 2u + (uint32_t)tlen + plen > (uint32_t)s_rxlen) {
+                return s_rxlen;
+            }
+
             if (plen > 0u) {
+                char tmp[CMD_MAX];
+
                 n = (plen > (CMD_MAX - 1u)) ? (CMD_MAX - 1u) : (uint16_t)plen;
-                memcpy(s_cmd, &s_rx[hdr + 2u + tlen], n);
-                s_cmd[n]  = '\0';
-                s_cmdlen  = n;
-                s_cmd_new = 1u;
+
+                /* 先拷到临时缓冲判，判完再决定要不要落到 s_cmd。
+                 *
+                 * 不能直接 memcpy 进 s_cmd：s_cmd 是"待取命令"的公开缓冲，
+                 * 如果上一条真命令还没被调用方取走（s_cmd_new 还是 1），
+                 * 这次把回推文本覆写进去，调用方取到的就是 {"ts":...}，
+                 * 串口上冒一行 "[cmd] no known key: {\"ts\":179440..."。
+                 * 回推是每 2 秒一次的高频包，一旦撞上就必现。 */
+                memcpy(tmp, &s_rx[hdr + 2u + tlen], n);
+                tmp[n] = '\0';
+
+                /* 巴法云会把设备自己上报的报文回推一份。认出来直接丢，
+                 * 不交给 cmd_apply —— 否则每 2 秒刷一行 "no known key"，
+                 * 阻塞式 printf 会把串口占满、连心跳应答都挤不进来。
+                 * 判断只能放在拷贝之后：载荷在 s_rx 里没有结束符，
+                 * 就地 strstr 会读越界。 */
+                if (strstr(tmp, "\"ts\"") == NULL) {
+                    memcpy(s_cmd, tmp, (size_t)n + 1u);
+                    s_cmdlen  = n;
+                    s_cmd_new = 1u;
+                }
             }
         }
     } else if (type == 9u) {
@@ -331,10 +369,13 @@ int mqtt_subscribe(const char *topic)
  *   于是 PUBLISH 一路"成功"，Flash 里的记录被逐条标记已发，
  *   断网期间的数据被永久丢弃。所以这里要真发、真等、真校验。
  *
- * 三步顺序不能反：
- *   1) 先 flush —— socket 里可能残留上一条报文的尾巴，不清掉会被当成 PINGRESP
- *   2) 发 PINGREQ
- *   3) 1 秒内等 2 字节并校验 0xD0 0x00
+ * 两步，顺序不能反：
+ *   1) 发 PINGREQ（固定 2 字节 0xC0 0x00）
+ *   2) 最多等 2 秒（20 × 100ms），期间用同一个解析器收包 —— broker 正在
+ *      推下行也会被顺手消化掉，PINGRESP 照样认得出来
+ *
+ * 为什么不"先 flush 再死等 2 字节"：那是早期写法，撞上 broker 正在推
+ * 下行就会把下行报文当成 PINGRESP（或反过来）而误判链路已死。
  *
  * 节奏要和 CONNECT 里声明的 keepalive 配合：我们声明 30 秒，
  * 实际空闲 20 秒就发一次，留出网络抖动的余量。
@@ -342,8 +383,7 @@ int mqtt_subscribe(const char *topic)
  * @return  0 成功（收到合法 PINGRESP）
  *         -1 未连接
  *         -2 发送失败（socket 已断）
- *         -3 超时，1 秒内没等到应答——链路大概率已死
- *         -4 收到的不是 PINGRESP（只来了半个包，或报文错位）
+ *         -3 2 秒内没等到应答——链路大概率已死
  */
 int mqtt_ping(void)
 {

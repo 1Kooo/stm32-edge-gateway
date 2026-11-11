@@ -44,7 +44,7 @@
 /* ---- memory ------------------------------------------------------------ */
 #define configSUPPORT_STATIC_ALLOCATION          0
 #define configSUPPORT_DYNAMIC_ALLOCATION         1
-#define configTOTAL_HEAP_SIZE                    ((size_t)(40 * 1024)) /* dev: 75KB */
+#define configTOTAL_HEAP_SIZE                    ((size_t)(32 * 1024)) /* dev: 75KB */
 #define configAPPLICATION_ALLOCATED_HEAP         0
 
 /* ---- hooks ------------------------------------------------------------- */

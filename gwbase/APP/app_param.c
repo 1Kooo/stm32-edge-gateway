@@ -32,7 +32,8 @@ typedef struct {
 static uint32_t s_seq  = 0u;    /* 当前生效记录的序号 */
 static uint8_t  s_slot = 1u;    /* 当前生效记录在哪一格：0=A 1=B（初值让首次写落 A） */
 
-/* CRC-16/CCITT。不用查表版：参数区一次只算 30 字节，表纯属浪费 flash。 */
+/* CRC-16/CCITT。不用查表版：参数区一次只算 24 字节
+ * （sizeof - offsetof(seq)，magic/ver/crc 三个字段不进 CRC），表纯属浪费 flash。 */
 static uint16_t crc16(const uint8_t *d, uint32_t n)
 {
     uint16_t c = 0xFFFFu;

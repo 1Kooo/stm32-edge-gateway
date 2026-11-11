@@ -29,11 +29,13 @@
 #include "net_if.h"
 #include "mqtt_client.h"
 #include "app_ota.h"
+#include "app_ota_flag.h"   /* app_golden_promote：云端 {"golden":1} 的落地 */
 #include "app_config.h"
 #include "app_ui.h"         /* ui_task 入口 + ui_snapshot_t + 显示数据 getter */
 #include "app_wifi_cfg.h"   /* 屏上配的 WiFi 凭据：待写缓冲 + 落盘 */
 #include "app_wdg.h"        /* 看门狗心跳槽位定义 */
 #include "app_param.h"      /* 掉电保存的运行参数（周期 + 告警阈值） */
+#include "app_event.h"      /* 系统事件日志：断网/对时/OTA/告警等留痕 */
 
 /* ================= 断言与内核钩子 ================= */
 void app_assert_failed(const char *file, int line)
@@ -189,7 +191,11 @@ TaskHandle_t ui_task_handle;
 /* ================= 网络任务 ================= */
 // 唯一拥有 USART3 的任务：AT 指令交互全部在这里，其他任务不许读 WiFi 串口
 void net_task(void *args);
-#define NET_TASK_STACK_SIZE  768
+/* 896 而不是 768：CMD_PARAM_MAX 提到 128 后，net_task 顶部常驻的
+ * cmd[] 多占 64 字节，cmd_apply 里的 buf[] 同步调用时再叠 64。
+ * 实测高水位 195 字（=768 栈的剩余），加 128 字节后只剩约 163 字，
+ * 压 20% 安全线（154 字）。提到 896 把余量拉回 227 字。 */
+#define NET_TASK_STACK_SIZE  896
 #define NET_TASK_PRIORITY    2
 TaskHandle_t net_task_handle;
 
@@ -202,13 +208,23 @@ TaskHandle_t net_task_handle;
  *   wdg_task 每 WDG_FEED_MS 检查一遍，五个都在 WDG_STALL_MS 内推进过才喂。
  *   任一任务停滞就停止喂，等硬件计数器耗尽把整机复位。
  *
- * IWDG 超时 ≈ 30 秒（LSI 32.768kHz / 分频 256 / 重装 3840），以下是硬件上限：
- * 分频最大 256、重装值 12 位，想再长也长不了。
+ * IWDG 超时 ≈ 30 秒（LSI 约 32kHz / 分频 256 / 重装 3840，算下来 30.7 秒），
+ * 以下是硬件上限：分频最大 256、重装值 12 位，想再长也长不了。
+ * 注意 F4 的 LSI 是片内 RC，不是 32.768kHz 晶振，实际频率有离散性
+ * （手册给的范围很宽），所以这个 30 秒只是量级，不能当精确值用。
  * 窗口 20s 不是随便取的：net_task 断网重连会睡 10 秒，窗口必须大于它，
  * 否则正常工况下就会被误判停滞、反复自复位。 */
 #define WDG_ENABLE       1              /* 调试期改 0 可整体关掉（IWDG 启动后关不掉） */
 #define WDG_FEED_MS      5000u          /* 检查 + 喂狗周期 */
 #define WDG_STALL_MS     20000u         /* 某任务超过这么久没推进 → 判停滞 */
+
+/* 长睡眠一律按这个粒度切片，每片打一次心跳卡。
+ *
+ * 为什么必须切：云端能把 mb 周期改到 60 秒，整段睡下去的话，
+ * 第 20 秒就被判停滞 → 停止喂狗 → 约 30 秒后复位；而那个 60 秒已经
+ * 落进参数区，重启后又读回同一个值 —— 变成永久复位循环，只有清参数能救。
+ * 切片之后"睡着"也算在推进，判停滞只管"卡死"，不管"故意慢"。 */
+#define WDG_SLEEP_SLICE_MS  4000u       /* 4 秒一片：20 秒窗口里至少打 5 次 */
 
 /* 每个任务最后一次推进的时刻（HAL_GetTick）。32 位对齐写，M4 上单指令完成，
  * 不需要临界区就能让 wdg_task 安全读。槽位定义在 app_wdg.h。 */
@@ -217,6 +233,49 @@ static volatile uint32_t s_hb_tick[WDG_HB_NUM];
 void app_wdg_kick(uint8_t id)
 {
     if (id < WDG_HB_NUM) s_hb_tick[id] = HAL_GetTick();
+}
+
+/* IWDG 句柄做成文件级静态：app_main 在调度器之前就要把它跑起来，
+ * wdg_task 之后只是接着用同一个句柄。
+ * 硬件只允许初始化一次（PR/RLR 写过就锁在硬件里），所以 s_wdg_on 是"已初始化"
+ * 的唯一判据，重复调用直接返回。 */
+#if WDG_ENABLE
+static IWDG_HandleTypeDef s_iwdg;
+static uint8_t            s_wdg_on = 0u;
+#endif
+
+uint8_t app_wdg_start_early(void)
+{
+#if WDG_ENABLE
+    if (s_wdg_on != 0u) {
+        return 0u;
+    }
+
+    s_iwdg.Instance       = IWDG;
+    s_iwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    s_iwdg.Init.Reload    = 3840u;      /* 3840 × 256 / 32000 ≈ 30.7 秒（LSI 约 32kHz） */
+
+    if (HAL_IWDG_Init(&s_iwdg) != HAL_OK) {
+        app_log("[wdg] IWDG init FAIL, no protection\r\n");
+        return 1u;
+    }
+
+    s_wdg_on = 1u;
+    app_log("[wdg] on, timeout ~30s, stall window %us\r\n",
+            (unsigned)(WDG_STALL_MS / 1000u));
+    return 0u;
+#else
+    return 1u;
+#endif
+}
+
+void app_wdg_feed(void)
+{
+#if WDG_ENABLE
+    if (s_wdg_on != 0u) {
+        HAL_IWDG_Refresh(&s_iwdg);
+    }
+#endif
 }
 
 void wdg_task(void *args);
@@ -283,14 +342,15 @@ void led_task(void *args)
 
 void beat_task(void *args)
 {
-    uint32_t sec = 0;
     (void)args;
 
     while (1)
     {
-        sec++;
-        app_log("[beat] t=%lus heap=%u stack=%u mb=%lu\r\n",
-                (unsigned long)sec,
+        /* 打印上电以来的真实秒数。原来打的是"第几次心跳"，周期 5 秒，
+         * 标签却写成 t=Ns —— 看到 t=15s 以为是 15 秒，实际已经 75 秒，
+         * 拿它推算别的任务停摆时间会全错。 */
+        app_log("[beat] up=%lus heap=%u stack=%u mb=%lu\r\n",
+                (unsigned long)(HAL_GetTick() / 1000u),
                 (unsigned)xPortGetFreeHeapSize(),
                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
                 (unsigned long)s_mb_ok);
@@ -298,28 +358,28 @@ void beat_task(void *args)
     }
 }
 
-/* 看门狗任务：先把 IWDG 跑起来，再每 5 秒查一轮心跳。
+/* 看门狗任务：每 5 秒查一轮心跳，全部在窗口内推进过才喂。
  * 判据是"每个任务各自最后一次推进距今多久"，而不是"总共发生了几次" ——
- * 计数法分不清是谁没来，ui_task 十毫秒一圈就够把计数刷满。 */
+ * 计数法分不清是谁没来，ui_task 五毫秒一圈就够把计数刷满。
+ *
+ * IWDG 本身早在 app_main 里就开好了（见 app_wdg_start_early），
+ * 这里只负责"喂不喂"这个决策。 */
 void wdg_task(void *args)
 {
 #if WDG_ENABLE
-    IWDG_HandleTypeDef hiwdg;
     uint8_t  i;
     uint8_t  ok;
     uint8_t  stall_id = 0;
     uint8_t  reported = 0;      /* 同一次停滞只报一行，别刷爆串口 */
 
-    hiwdg.Instance       = IWDG;
-    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
-    hiwdg.Init.Reload    = 3840u;   /* 3840 × 256 / 32768 ≈ 30 秒 */
-    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
-        app_log("[wdg] IWDG init FAIL, no protection\r\n");
+    /* 兜底：正常情况下 app_main 早就开好了，这里只是保证不会出现
+     * "调度器在跑、看门狗却没开"的半吊子状态 */
+    if (app_wdg_start_early() != 0u) {
         vTaskDelete(NULL);          /* 没有看门狗也别占着任务 */
         return;
     }
-    app_log("[wdg] on, timeout ~30s, stall window %us\r\n",
-            (unsigned)(WDG_STALL_MS / 1000u));
+
+    app_wdg_feed();                 /* 进循环前补一次，抹掉启动阶段的消耗 */
 #endif
 
     (void)args;
@@ -338,7 +398,7 @@ void wdg_task(void *args)
         }
 
         if (ok) {
-            HAL_IWDG_Refresh(&hiwdg);
+            app_wdg_feed();
             reported = 0;
         } else if (reported == 0u) {
             /* 先报再等死：复位后串口能直接告诉你哪个任务卡了 */
@@ -428,14 +488,21 @@ void uart_poll_task(void *args)
             taskEXIT_CRITICAL();
         }
 
-        /* 固定 2 秒一轮。轮询自带 200ms 超时，不再需要"串口有数据就提前醒"，
+        /* 按 s_mb_period_ms 一轮（默认 2000ms，云端可改，钳位 500~60000）。轮询自带 200ms 超时，不再需要"串口有数据就提前醒"，
          * 否则收到的每个字节都会把任务从睡眠里拽出来一次。 */
         /* 先读一次到局部再延时：volatile 变量两次读之间可能被云端改掉，
          * 那样算出来的周期会对不上 */
         {
             uint32_t period = s_mb_period_ms;
+            uint32_t slice;
 
-            vTaskDelay(pdMS_TO_TICKS(period));
+            /* 切片睡，每片打一次心跳卡：周期上限 60 秒，整段睡会踩停滞窗口 */
+            while (period > 0u) {
+                slice = (period > WDG_SLEEP_SLICE_MS) ? WDG_SLEEP_SLICE_MS : period;
+                vTaskDelay(pdMS_TO_TICKS(slice));
+                period -= slice;
+                app_wdg_kick(WDG_HB_UART);
+            }
         }
     }
 }
@@ -444,8 +511,19 @@ void uart_poll_task(void *args)
 /* 上报周期也是变量：云端可改。默认和采样同速，稳态不积压 */
 static volatile uint32_t s_pub_period_ms = 2000u;
 #define PUB_PERIOD_MIN_MS    1000u
-#define PUB_PERIOD_MAX_MS    3600000u   /* 上限一小时，防止手滑写成天文数字 */
-#define CMD_PARAM_MAX        64u        /* 云命令文本上限 */
+/* 上限必须压在 keepalive 以下（MQTT_KEEPALIVE_S = 30 秒）：内层循环只在
+ * 一轮结束时才发 PINGREQ，pub 周期多长，心跳间隔就至少多长。原来放到一小时
+ * 等于让链路必然超时 —— broker 按 1.5×30s 判死，下一次 publish 直接失败，
+ * 设备陷进"连上 → 睡一小时 → 被踢 → 重连"的循环，数据一条也稳不住。
+ * 20 秒留出一次心跳的余量；同时它也没超过看门狗 20 秒的停滞窗口，
+ * 再配合下面的切片睡眠，两边都不会被误判。 */
+#define PUB_PERIOD_MAX_MS    20000u
+/* 128 而不是 64：一条命令带多个键时很容易顶到上限，
+ * 比如 {"tmin":-400,"tmax":800,"hmin":0,"hmax":1000} 就已经 44 字节，
+ * 再加 "mb"/"pub"/"alarm" 就超了。超了不会报错，只会被静默截断 ——
+ * 后半截参数不生效，现场极难查（看着命令发出去了，实际只改了一半）。
+ * 必须和 mqtt_client.c 的 CMD_MAX 保持一致，否则解析器那一端还会卡回 64。 */
+#define CMD_PARAM_MAX        128u       /* 云命令文本上限 */
 
 /* 当前生效参数（RAM 副本）。改它、标脏，落盘交给 storage_task。
  * 上电由 app_cfg_init() 从外部 Flash 读进来。 */
@@ -469,11 +547,24 @@ static uint32_t          s_alarm_last = 0u;    /* 上次发事件提醒的时刻
  * 置标志由 net_task 在循环里体面地收尾再重启。 */
 static volatile uint8_t s_reboot_pending = 0u;
 
+/* 云端 {"golden":1} 的执行标志：固化要擦上百个扇区，只能交给
+ * storage_task（外部 Flash 的唯一写者）在它自己的循环里做。 */
+static volatile uint8_t s_golden_pending = 0u;
+
 /* 上电初始化：读参数区，把值和默认周期对上。
  * 由 app_main 在 drv_flash_init() 之后、调度器启动之前调用。 */
 void app_cfg_init(void)
 {
     int r = app_param_load(&s_param);
+
+    /* 参数区里的值可能是更早的固件写进去的，那会儿的上下限和现在不一样
+     * （比如 pub 曾经允许一小时）。这里统一再钳一次：读回一个超长周期，
+     * 心跳间隔跟着变长，链路和看门狗都会被拖垮。钳位只在 RAM 生效，
+     * 不回写 Flash —— 每次上电重钳一次，结果一样，省一次擦写。 */
+    if (s_param.mb_ms < MB_PERIOD_MIN_MS)   s_param.mb_ms = MB_PERIOD_MIN_MS;
+    if (s_param.mb_ms > MB_PERIOD_MAX_MS)   s_param.mb_ms = MB_PERIOD_MAX_MS;
+    if (s_param.pub_ms < PUB_PERIOD_MIN_MS) s_param.pub_ms = PUB_PERIOD_MIN_MS;
+    if (s_param.pub_ms > PUB_PERIOD_MAX_MS) s_param.pub_ms = PUB_PERIOD_MAX_MS;
 
     s_mb_period_ms  = s_param.mb_ms;
     s_pub_period_ms = s_param.pub_ms;
@@ -548,9 +639,11 @@ static void scan_service(void)
 
 /* 云端下发命令：{"mb":5000,"pub":10000}，两个键都可选，单位毫秒。
  *
- * 只认这两个键，其余一概不动 —— 我们自己上报的 JSON（ts/temp/humi/seq）
+ * 可识别的键：mb / pub / tmin / tmax / hmin / hmax / alarm / golden /
+ * reboot / reset，其余一概不动 —— 我们自己上报的 JSON（ts/temp/humi/seq）
  * 万一被 broker 回推过来，也不会误触发。
- * 改动只落在 RAM：断电回到编译默认值，要断电保留得等参数区那一期。 */
+ * 改动立即生效并置脏标志，由 storage_task 落参数区（A/B 双扇区 + CRC16），
+ * 断电后仍保留；恢复出厂值走 {"reset":1}。 */
 static void cmd_apply(const char *s, uint16_t len)
 {
     char    *p;
@@ -603,55 +696,75 @@ static void cmd_apply(const char *s, uint16_t len)
     }
 
     /* 告警阈值：云端按"整度 / 整百分"发（{"tmax":60}），内部一律用 x10，
-     * 所以进来先乘 10。转发任何一条阈值命令都顺带把告警判定打开 ——
-     * 有人配阈值就说明他要告警，省得再发一条 {"alarm":1}。 */
-    p = strstr(buf, "\"tmin\"");
-    if (p != NULL) {
-        p = strchr(p, ':');
-        if (p != NULL) {
+     * 所以进来先乘 10。
+     *
+     * 四个键先全部解析到临时变量，**校验通过才写回**：
+     * 上下限配反（{"tmin":50,"tmax":10}）会让判断条件恒成立、告警永久亮着，
+     * 现场会误以为传感器坏了。整条命令拒收，不做静默纠正 —— 纠正了没人
+     * 知道自己配错了，拒收至少日志里有一条。
+     *
+     * 任何一条阈值命令都顺带打开告警：配阈值本身就说明他要告警。 */
+    {
+        long    t_min = s_param.t_min_x10;
+        long    t_max = s_param.t_max_x10;
+        long    h_min = (long)s_param.h_min_x10;
+        long    h_max = (long)s_param.h_max_x10;
+        uint8_t got_t = 0u;
+        uint8_t got_h = 0u;
+
+        p = strstr(buf, "\"tmin\"");
+        if (p != NULL && (p = strchr(p, ':')) != NULL) {
             lv = strtol(p + 1, NULL, 10) * 10L;
             if (lv < MB_TEMP_MIN_X10) lv = MB_TEMP_MIN_X10;
             if (lv > MB_TEMP_MAX_X10) lv = MB_TEMP_MAX_X10;
-            s_param.t_min_x10 = (int16_t)lv;
-            s_param.alarm_en  = 1u;
-            hit = 1u;
+            t_min = lv;
+            got_t = 1u;
         }
-    }
 
-    p = strstr(buf, "\"tmax\"");
-    if (p != NULL) {
-        p = strchr(p, ':');
-        if (p != NULL) {
+        p = strstr(buf, "\"tmax\"");
+        if (p != NULL && (p = strchr(p, ':')) != NULL) {
             lv = strtol(p + 1, NULL, 10) * 10L;
             if (lv < MB_TEMP_MIN_X10) lv = MB_TEMP_MIN_X10;
             if (lv > MB_TEMP_MAX_X10) lv = MB_TEMP_MAX_X10;
-            s_param.t_max_x10 = (int16_t)lv;
-            s_param.alarm_en  = 1u;
-            hit = 1u;
+            t_max = lv;
+            got_t = 1u;
         }
-    }
 
-    p = strstr(buf, "\"hmin\"");
-    if (p != NULL) {
-        p = strchr(p, ':');
-        if (p != NULL) {
+        p = strstr(buf, "\"hmin\"");
+        if (p != NULL && (p = strchr(p, ':')) != NULL) {
             lv = strtol(p + 1, NULL, 10) * 10L;
             if (lv < 0L) lv = 0L;
             if (lv > (long)MB_HUMI_MAX_X10) lv = (long)MB_HUMI_MAX_X10;
-            s_param.h_min_x10 = (uint16_t)lv;
-            s_param.alarm_en  = 1u;
-            hit = 1u;
+            h_min = lv;
+            got_h = 1u;
         }
-    }
 
-    p = strstr(buf, "\"hmax\"");
-    if (p != NULL) {
-        p = strchr(p, ':');
-        if (p != NULL) {
+        p = strstr(buf, "\"hmax\"");
+        if (p != NULL && (p = strchr(p, ':')) != NULL) {
             lv = strtol(p + 1, NULL, 10) * 10L;
             if (lv < 0L) lv = 0L;
             if (lv > (long)MB_HUMI_MAX_X10) lv = (long)MB_HUMI_MAX_X10;
-            s_param.h_max_x10 = (uint16_t)lv;
+            h_max = lv;
+            got_h = 1u;
+        }
+
+        if ((got_t || got_h) && (t_min >= t_max || h_min >= h_max)) {
+            /* 上下限相等也算错：那是一个点，不构成区间。
+             * 整条命令作废 —— 混合命令里的 reboot/golden 也一并不执行，
+             * 免得"参数没收下、设备却重启了"这种半执行状态。 */
+            app_log("[cmd] bad range (min>=max), whole cmd ignored\r\n");
+            return;
+        }
+
+        if (got_t) {
+            s_param.t_min_x10 = (int16_t)t_min;
+            s_param.t_max_x10 = (int16_t)t_max;
+            s_param.alarm_en  = 1u;
+            hit = 1u;
+        }
+        if (got_h) {
+            s_param.h_min_x10 = (uint16_t)h_min;
+            s_param.h_max_x10 = (uint16_t)h_max;
             s_param.alarm_en  = 1u;
             hit = 1u;
         }
@@ -666,6 +779,18 @@ static void cmd_apply(const char *s, uint16_t len)
         }
     }
 
+    /* 固化黄金备份：值必须给 1。只置标志，真正的擦写在 storage_task 里做 ——
+     * 这里在 net_task 上下文，擦 140 个扇区要十几秒，会把 AT 状态机拖死。 */
+    p = strstr(buf, "\"golden\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL && strtoul(p + 1, NULL, 10) == 1u) {
+            s_golden_pending = 1u;
+            hit = 1u;
+            app_log("[cmd] golden promote scheduled\r\n");
+        }
+    }
+
     /* 远程重启：值必须给 1，{"reboot":0} 当没看见 —— 防手滑把设备踢重启 */
     p = strstr(buf, "\"reboot\"");
     if (p != NULL) {
@@ -673,6 +798,7 @@ static void cmd_apply(const char *s, uint16_t len)
         if (p != NULL && strtoul(p + 1, NULL, 10) == 1u) {
             s_reboot_pending = 1u;
             hit = 1u;
+            app_event_log(EVT_REBOOT, 0u);
         }
     }
 
@@ -694,6 +820,7 @@ static void cmd_apply(const char *s, uint16_t len)
 
             s_reboot_pending = 1u;      /* 重启让所有任务按默认值重新起步 */
             hit = 1u;
+            app_event_log(EVT_FACTORY, 0u);
         }
     }
 
@@ -709,6 +836,7 @@ static void cmd_apply(const char *s, uint16_t len)
     /* 标脏，由 storage_task 落盘。这里绝不碰 Flash：擦扇区要几十毫秒，
      * 又可能和 OTA 下载抢 SPI 总线。 */
     s_param_dirty = 1u;
+    app_event_log(EVT_PARAM_CHG, 0u);
 
     app_log("[cmd] mb=%lu pub=%lu t=%d~%d h=%u~%u alarm=%u\r\n",
             (unsigned long)s_param.mb_ms, (unsigned long)s_param.pub_ms,
@@ -736,6 +864,7 @@ void net_task(void *args)
     uint32_t      budget;
     uint32_t      sent;
     uint8_t       ping_fail;            /* 连续收不到 PINGRESP 的次数 */
+    uint8_t       down_rsn;             /* 断链原因，写给事件日志 */
     TickType_t    t_start;
 
     (void)args;
@@ -747,6 +876,15 @@ void net_task(void *args)
     for (;;)
     {
         app_wdg_kick(WDG_HB_NET);
+
+        /* 黄金固化进行中：这段时间不碰外部 Flash。上报流程要给记录写"已发送"
+         * 标记，会和擦除操作抢 SPI；而如果去抢互斥量会一直阻塞到固化结束，
+         * 心跳断供反而把固化打断。二十几秒不发布不致命 —— keepalive 30 秒、
+         * broker 容忍 1.5 倍，留有余量。 */
+        if (app_golden_busy() != 0u) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
         /* 0. OTA 请求优先处理。
          *
@@ -768,6 +906,9 @@ void net_task(void *args)
             if (r != 0) {
                 app_log("[ota] FAILED (%d), back to normal\r\n", r);
                 app_ota_set_fail((int8_t)r);   /* 转告弹窗：红字显示失败原因 */
+                /* 成功时 app_ota_run 内部直接复位装新固件，走不到这里，
+                 * 所以这里只需要记失败 */
+                app_event_log(EVT_OTA_FAIL, (uint8_t)(-r));
             }
 
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -870,10 +1011,12 @@ void net_task(void *args)
                 drv_rtc_set_unix(ntp_ts);
                 drv_rtc_mark_synced();      /* 从此这份时间可信，屏上可以显示 */
                 s_ntp_done = 1u;
+                app_event_log(EVT_NTP_OK, 0u);
             } else {
                 s_ntp_try++;
                 app_log("[ntp] sync FAIL (%u/%u), retry on next reconnect\r\n",
                         (unsigned)s_ntp_try, (unsigned)NTP_TRY_MAX);
+                app_event_log(EVT_NTP_FAIL, (uint8_t)s_ntp_try);
             }
         }
 
@@ -895,12 +1038,14 @@ void net_task(void *args)
         }
 
         s_mqtt_up = 1;
+        down_rsn  = 0u;
+        app_event_log(EVT_NET_UP, 0u);
         last_ping = HAL_GetTick();
         ping_fail = 0;                  /* 新链路，心跳计数从零开始 */
 
         /* 4. 从 Flash 消费：读一条 -> 发一条 -> 标一条 -> 指针前进。
          *    实时上报和断网补传走同一段代码，区别只在节奏：
-         *    积压少时 2 秒一条，积压多时一轮连发 10 条、间隔 200ms 追平。 */
+         *    积压少时 2 秒一条，积压多时一轮连发 5 条、间隔 200ms 追平。 */
         while (net_if_state() == NET_READY)
         {
             /* MQTT 稳定连接时 net_task 一直待在这个内层循环里，
@@ -927,6 +1072,43 @@ void net_task(void *args)
             }
 
             t_start = xTaskGetTickCount();      /* 用来补偿发送耗时，避免周期漂移 */
+
+            /* 心跳放在发布之前，三条理由：
+             *
+             * 1) 时序。刚从 catch-up 连发几条下来，ESP-01S 的串口缓冲和
+             *    TCP 发送队列正是满的，PINGRESP 挤不进来，2 秒窗口不够，
+             *    于是误报 FAIL(-3)。先测心跳时队列是空的，几毫秒就回来。
+             *
+             * 2) 判据要新鲜。下面发布守卫 if (ping_fail == 0) 想表达的是
+             *    "这条链路现在活着"，不是"上一轮还活着"。先测再发，链路
+             *    已经死掉时本轮一条都不发，避免 mqtt_publish() 返回成功、
+             *    log_mark_sent() 标成已发、数据却根本没到云端。
+             *
+             * 3) 反应要快。心跳失败立刻让 ping_fail 变 1，紧接着的守卫
+             *    本轮就生效；放在后面则要等下一轮才停发。
+             *
+             * 代价是本轮最多多等 2 秒，但 t_start 取在上面，周期补偿会
+             * 把这段时间扣掉，长期节奏不变。 */
+            if ((HAL_GetTick() - last_ping) >= MQTT_PING_IDLE_MS) {
+                last_ping = HAL_GetTick();
+
+                r = mqtt_ping();            /* 发 PINGREQ + 等 PINGRESP，最多 2 秒 */
+                if (r == 0) {
+                    ping_fail = 0;          /* 真收到应答，链路确认活着 */
+                } else {
+                    /* 不一次判死：网络抖动、ESP 偶尔忙不过来都会漏一两次，
+                     * 连续 3 次（约 30 秒）收不到才认为链路已死。 */
+                    ping_fail++;
+                    app_log("[mqtt] ping FAIL (%d) %u/%u\r\n", r,
+                            (unsigned)ping_fail, (unsigned)MQTT_PING_FAIL_MAX);
+
+                    if (ping_fail >= MQTT_PING_FAIL_MAX) {
+                        app_log("[mqtt] link dead, reconnecting\r\n");
+                        down_rsn = 1u;      /* 心跳没回应 */
+                        break;
+                    }
+                }
+            }
 
             backlog = log_pending();
             budget  = (backlog > MQTT_BACKLOG_MARK) ? MQTT_CATCHUP_MAX : 1u;
@@ -993,12 +1175,14 @@ void net_task(void *args)
                     if (mqtt_publish(topic, (const uint8_t *)payload,
                                      (uint16_t)strlen(payload)) != 0) {
                         app_log("[mqtt] publish FAIL, reconnecting\r\n");
+                        down_rsn = 2u;      /* 发不出去 */
                         goto link_down;
                     }
 
                     /* 标不上就不能让指针前进，否则这条记录永远补不回来 */
                     if (log_mark_sent(addr) != 0) {
                         app_log("[mqtt] mark FAIL at 0x%06lX\r\n", (unsigned long)addr);
+                        down_rsn = 2u;
                         goto link_down;
                     }
 
@@ -1010,9 +1194,9 @@ void net_task(void *args)
                     }
 
                     /* 补传不能连发。实测连发约 26 条/秒，会把 ESP-01S 的串口缓冲
-                     * 和 TCP 发送队列灌满，导致 AT 应答挤不进来、心跳 1 秒内收不到
-                     * PINGRESP，30 秒后误判链路已死（日志表现：catch-up 刷屏后
-                     * 突然 ping FAIL -3 三连）。
+                     * 和 TCP 发送队列灌满，导致 AT 应答挤不进来（心跳那侧的
+                     * 误判已经靠"心跳挪到发布之前"解决，但缓冲灌满本身还会
+                     * 拖慢命令下发，所以间隔仍然要留）。
                      * 每条间隔 200ms 约 5 条/秒，比稳态快 10 倍，追得动又不噎住。 */
                     if (sent < budget) {
                         vTaskDelay(pdMS_TO_TICKS(MQTT_CATCHUP_GAP_MS));
@@ -1043,26 +1227,6 @@ void net_task(void *args)
                 NVIC_SystemReset();
             }
 
-            if ((HAL_GetTick() - last_ping) >= MQTT_PING_IDLE_MS) {
-                last_ping = HAL_GetTick();
-
-                r = mqtt_ping();            /* 发 PINGREQ + 等 PINGRESP，最多 2 秒 */
-                if (r == 0) {
-                    ping_fail = 0;          /* 真收到应答，链路确认活着 */
-                } else {
-                    /* 不一次判死：网络抖动、ESP 偶尔忙不过来都会漏一两次，
-                     * 连续 3 次（约 30 秒）收不到才认为链路已死。 */
-                    ping_fail++;
-                    app_log("[mqtt] ping FAIL (%d) %u/%u\r\n", r,
-                            (unsigned)ping_fail, (unsigned)MQTT_PING_FAIL_MAX);
-
-                    if (ping_fail >= MQTT_PING_FAIL_MAX) {
-                        app_log("[mqtt] link dead, reconnecting\r\n");
-                        break;
-                    }
-                }
-            }
-
             app_wdg_kick(WDG_HB_NET);       /* 内层每转一圈也算推进 */
 
             /* 积压时快跑追平，追平后回到正常节奏。
@@ -1074,8 +1238,16 @@ void net_task(void *args)
                 uint32_t period = (ping_fail == 0 && backlog > MQTT_BACKLOG_MARK)
                                   ? MQTT_CATCHUP_MS : s_pub_period_ms;
                 uint32_t used   = (uint32_t)(xTaskGetTickCount() - t_start);
+                uint32_t remain = (used < period) ? (period - used) : 1u;
+                uint32_t slice;
 
-                vTaskDelay(pdMS_TO_TICKS((used < period) ? (period - used) : 1u));
+                /* 同样切片睡：这里睡的是上报周期，最长 20 秒，正好顶到停滞窗口边上 */
+                while (remain > 0u) {
+                    slice = (remain > WDG_SLEEP_SLICE_MS) ? WDG_SLEEP_SLICE_MS : remain;
+                    vTaskDelay(pdMS_TO_TICKS(slice));
+                    remain -= slice;
+                    app_wdg_kick(WDG_HB_NET);
+                }
             }
         }
 
@@ -1084,12 +1256,15 @@ void net_task(void *args)
         mqtt_reset();
         net_if_close();
         app_log("[net] link down, reconnecting\r\n");
+        app_event_log(EVT_NET_DOWN, down_rsn);
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
 /* ================= 存储：外部 Flash 日志区（顺序追加，写满即停） ================= */
-#define LOG_BASE        0x00400000u     /* 日志区起点（跳过 OTA 暂存 1MB + 字库 2MB） */
+#define LOG_BASE        0x00400000u     /* 日志区起点：前面依次是 OTA 暂存 1MB、
+                                         * 黄金备份 1MB、字库预留 2MB（字库实际编译
+                                         * 进片内 Flash，这块只是占位），共跳过 4MB */
 #define LOG_END         0x00700000u     /* 3MB = 196608 条；写满且全部已发后回到 LOG_BASE */
 #define LOG_SCAN_CHUNK  512u            /* 扫描块；512 / 16 = 32 条整，不会切断记录 */
 
@@ -1189,7 +1364,15 @@ static int log_append(const sensor_record_t *rec)
             s_log_rptr = LOG_BASE;
             s_log_full = 0u;
             app_log("[store] drained, wrap to base\r\n");
+            app_event_log(EVT_STORE_WRAP, 0u);
         } else {
+            /* 停记是件该被人知道的事，记一次事件（只记一次，靠 s_log_full 挡住） */
+            static uint8_t s_full_logged = 0u;
+
+            if (s_full_logged == 0u) {
+                s_full_logged = 1u;
+                app_event_log(EVT_STORE_FULL, 0u);
+            }
             rc = -2;
             goto out;
         }
@@ -1229,13 +1412,25 @@ out:
 static uint32_t log_pending(void)
 {
     uint32_t p;
+    uint8_t  locked = 0u;
 
     if (!s_log_ready) return 0u;      /* 扫描期间指针是临时值，不能拿来算 */
 
-    if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+    /* 有超时，不等到底。黄金固化会独占这把锁二十多秒，无限等会让
+     * net_task 一直卡在这里、心跳断掉，被看门狗判停滞然后整机复位
+     * （实测踩过：[wdg] STALL id=4 紧跟 [param] saved）。
+     * 拿不到就当"这轮没有待发数据"，500ms 后下一轮再看。 */
+    if (s_flash_mutex != NULL) {
+        if (xSemaphoreTake(s_flash_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            return 0u;
+        }
+        locked = 1u;
+    }
+
     p = (s_log_wptr > s_log_rptr)
         ? ((s_log_wptr - s_log_rptr) / SENSOR_RECORD_SIZE) : 0u;
-    if (s_flash_mutex) xSemaphoreGive(s_flash_mutex);
+
+    if (locked != 0u) xSemaphoreGive(s_flash_mutex);
 
     return p;
 }
@@ -1246,13 +1441,19 @@ static int log_peek_next(log_entry_t *e, uint32_t *addr)
 {
     int      rc = -1;
     uint32_t end;
+    uint8_t  locked = 0u;
 
     if (!s_log_ready) {
         return -1;
     }
 
-    if (s_flash_mutex) {
-        xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+    /* 和 log_pending 同理：等 200ms 拿不到就返回"这轮没得发"，
+     * 不能为了读一条记录把 net_task 的心跳按住二十秒。 */
+    if (s_flash_mutex != NULL) {
+        if (xSemaphoreTake(s_flash_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            return -1;
+        }
+        locked = 1u;
     }
 
     /* 先把写指针存一份：循环里只读它，避免中途被别的任务改掉导致判断错位 */
@@ -1277,7 +1478,7 @@ static int log_peek_next(log_entry_t *e, uint32_t *addr)
         break;
     }
 
-    if (s_flash_mutex) {
+    if (locked != 0u) {
         xSemaphoreGive(s_flash_mutex);
     }
 
@@ -1288,10 +1489,24 @@ static int log_peek_next(log_entry_t *e, uint32_t *addr)
  * 成功后读指针前进一格；写失败不动指针 —— 否则这条记录永远补不回来。 */
 static int log_mark_sent(uint32_t addr)
 {
-    uint8_t st = LOG_ST_SENT;
-    int     rc;
+    uint8_t  st = LOG_ST_SENT;
+    int      rc;
+    uint16_t waits = 0u;
 
-    if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+    /* 这一处不能像 log_pending 那样"拿不到就算了"：标不上就不能让读指针
+     * 前进，否则这条记录永远补不回来、还会被重复上报。
+     * 改成边等边打心跳 —— 黄金固化占着锁的时候，把等待切成 500ms 一段，
+     * 每段踢一次心跳，net_task 就不会被看门狗判停滞；30 秒还拿不到锁
+     * 说明确实出问题了，按写失败返回，让调用方断链重来。 */
+    while (s_flash_mutex != NULL) {
+        if (xSemaphoreTake(s_flash_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            break;
+        }
+        app_wdg_kick(WDG_HB_NET);
+        if (++waits >= 60u) {
+            return -1;
+        }
+    }
 
     rc = drv_flash_write(addr + (uint32_t)offsetof(log_entry_t, state), &st, 1u);
     if (rc == 0 && s_log_rptr == addr) {
@@ -1310,6 +1525,12 @@ void storage_task(void *args)
     int      r;
     (void)args;
 
+    /* 算一次当前镜像 CRC（约 0.2 秒）：关于页靠它判断"黄金备份是不是
+     * 当前这版"。只算一次，之后只是比大小，不占运行时开销。
+     * 放在 log_store_init 之前 —— 那个要读 3MB（约十秒），先让这一项
+     * 落地，否则关于页在这十秒里会误显示成"备份是旧版本"。 */
+    app_golden_self_check();
+
     log_store_init();                 /* 必须先扫，否则会从 0x400000 覆盖旧数据 */
 
     while (1)
@@ -1327,6 +1548,30 @@ void storage_task(void *args)
         if (app_ota_busy()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
+        }
+
+        /* 事件落盘：别的任务只往队列里丢，真正写 Flash 在这里做。
+         * 放在参数落盘旁边，同样在"OTA 让路"之后。 */
+        app_event_flush();
+
+        /* 黄金备份固化：云端 {"golden":1} 触发。这里在 OTA 让路闸门之后，
+         * 所以 OTA 下载期间它只会一直等着（标志不会丢）。 */
+        if (s_golden_pending != 0u) {
+            s_golden_pending = 0u;
+            app_log("[golden] promote start\r\n");
+
+            /* 整段拿住 Flash 锁：固化要擦上百个扇区，期间不能让配网落盘
+             * 这类偶发写入插进来（两边操作同一颗 SPI Flash）。 */
+            if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+            if (app_golden_promote() == 0) {
+                /* 事件区留一条「已固化」：关于页的时间显示就是从这条里取的 */
+                app_event_log(EVT_GOLDEN, 0u);
+            } else {
+                app_log("[golden] promote FAIL, no golden now\r\n");
+            }
+            if (s_flash_mutex) xSemaphoreGive(s_flash_mutex);
+
+            app_wdg_kick(WDG_HB_STORE);
         }
 
         /* 参数落盘：net_task 只置脏标志，真正擦写在这里做。
@@ -1455,6 +1700,12 @@ void sample_task(void *args)
         if (ev_kind != 0u) {
             s_ev_pending = ev_kind;
             s_ev_seq     = rec.seq;
+
+            if (ev_kind == 1u) {
+                app_event_log(EVT_ALARM_ON, s_alarm_flags);   /* arg = 哪一路越限 */
+            } else if (ev_kind == 3u) {
+                app_event_log(EVT_ALARM_OFF, 0u);
+            }
         }
         rec.ts       = drv_rtc_unix();   /* RTC 真实时间；降级时等于上电秒数 */
         rec.temp_x10 = t_x10;
@@ -1482,8 +1733,10 @@ void sample_task(void *args)
  *
  * UI 段拆去 app_ui.c 后，ui_task 不能再直接读这边的私有变量
  * （s_latest / s_mqtt_up / s_pub_cnt / log_pending()），
- * 统一从这四个只读 getter 走。临界区逻辑原来在 ui_task 里，
- * 原样搬进 app_data_get_snapshot()，行为不变。 */
+ * 统一从这几个只读 getter 走：app_data_get_snapshot / app_mqtt_up /
+ * app_pub_cnt / app_store_log_pending，以及后来给关于页"存储"行补的
+ * app_store_wptr / app_store_full，共 6 个。
+ * 临界区逻辑原来在 ui_task 里，原样搬进 app_data_get_snapshot()，行为不变。 */
 
 void app_data_get_snapshot(ui_snapshot_t *out)
 {

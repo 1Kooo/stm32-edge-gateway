@@ -64,6 +64,21 @@ def read_line(conn, buf):
     return line, rest
 
 
+def safe_send(conn, data):
+    """发一段数据，对方中途断开时返回 False，别让异常把整个服务端带崩。
+
+    板子在下载途中掉电 / 复位 / WiFi 掉线，这一端拿到的就是
+    BrokenPipeError、ConnectionResetError 这类 OSError（都是 OSError 子类）。
+    原来是直接抛出去的：serve_conn 没接，main 里也只 catch 了
+    KeyboardInterrupt，于是整个服务端进程跟着退出，下一次还得手动重开。
+    现场调试时这个现象很像"服务器自己挂了"，很难往"板子断了一下"上想。"""
+    try:
+        conn.sendall(data)
+        return True
+    except OSError:
+        return False
+
+
 def serve_conn(conn, peer, header, payload, chunk_size):
     buf = b""
     sent_chunks = 0
@@ -86,7 +101,16 @@ def serve_conn(conn, peer, header, payload, chunk_size):
             text = ""
 
         if text.startswith("OTA?"):
-            conn.sendall(header)
+            if not safe_send(conn, header):
+                print("[连接] 客户端断开（发固件头时）")
+                return
+            # 板子拿到固件头之后不会马上要第一块：它要先把暂存区的 141 个
+            # 扇区擦干净（每扇区 45~400ms，合计 6~14 秒），这段时间一个字节
+            # 都不发。沿用 10 秒读超时就会在擦除中途把连接掐断，现象是
+            # "第一次一块都没发就断开、第二次才下得动"（第二次扇区已是
+            # 擦除态，擦得快，赶在 10 秒内发出了 GET 0）。
+            # 所以这里单独放宽；收到第一个 GET 后立刻收回 10 秒。
+            conn.settimeout(60.0)
             print("[握手] 已发送固件头  magic=0x%08X" % struct.unpack("<I", header[0:4])[0])
             continue
 
@@ -97,12 +121,19 @@ def serve_conn(conn, peer, header, payload, chunk_size):
                 print("[错误] 无法解析偏移：%r" % text)
                 return
 
+            # 进入下载阶段，把超时收回 10 秒：每块之间有数据流动，
+            # 10 秒还没动静就是真断线，不该再等（否则故障被藏起来）。
+            conn.settimeout(10.0)
+
             if offset >= total:
                 print("[错误] 偏移 %d 超出固件长度 %d" % (offset, total))
                 return
 
             n = min(chunk_size, total - offset)
-            conn.sendall(payload[offset:offset + n])
+            if not safe_send(conn, payload[offset:offset + n]):
+                print("[连接] 客户端断开（已发 %d 块，第 %d 块没发出去）"
+                      % (sent_chunks, sent_chunks + 1))
+                return
             sent_chunks += 1
 
             # 每 20 块打一次，约 40KB，不刷屏
@@ -159,12 +190,26 @@ def main():
 
     try:
         while True:
-            conn, peer = srv.accept()
+            try:
+                conn, peer = srv.accept()
+            except OSError as e:
+                # 端口突然不可用之类的瞬时错误：歇一下接着等，不要整个退出
+                print("[错误] accept 失败：%s，1 秒后重试" % e)
+                time.sleep(1.0)
+                continue
+
             conn.settimeout(10.0)
             try:
                 serve_conn(conn, peer, header, payload, args.chunk)
+            except OSError as e:
+                # serve_conn 里的收发都过 safe_send / read_line，正常不会到这；
+                # 留着兜底，免得一个罕见错误把监听也带走
+                print("[连接] 异常断开：%s" % e)
             finally:
-                conn.close()
+                try:
+                    conn.close()
+                except OSError:
+                    pass
     except KeyboardInterrupt:
         print("")
         print("已停止")

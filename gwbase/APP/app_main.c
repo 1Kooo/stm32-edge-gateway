@@ -8,7 +8,8 @@
  *   3. WiFi 凭据（外部 Flash 配置区，喂给 net_if）
  *   4. LVGL 移植层（必须在起任务前，见下方注释）
  *   5. OTA 启动确认（新固件首跑，写 DONE 清 boot_try）
- *   6. App_freeRTOS_start() 起 7 个任务，不再回来
+ *   6. App_freeRTOS_start() 起 8 个任务（led/beat/wdg/uart/sample/
+ *      storage/ui/net），不再回来
  *
  * USART1 is owned by Public/usart.c (printf), so we never re-init it here.
  */
@@ -29,6 +30,8 @@
 #include "net_if.h"
 #include "app_config.h"
 #include "drv_rtc.h"
+#include "app_event.h"      /* app_event_init / EVT_POWER_ON */
+#include "app_wdg.h"        /* app_wdg_start_early / app_wdg_feed */
 
 /* 外 Flash 自检第一步就是擦 0x000000 —— 那正是 OTA 固件暂存槽。
  * 只要 APP 跑一次自检，暂存的新固件就没了，OTA 会随机失败且极难查。
@@ -83,6 +86,17 @@ void app_main(void)
     int      rf;
     int      ota_r;
 
+    /* ---------------- 看门狗最早期启动 ----------------
+     * 必须排在所有可能长时间阻塞的初始化之前。原因：wdg_task 要等调度器
+     * 启动才会跑，在那之前如果卡在 RTC 等晶振、事件区扫描、LCD/LVGL 初始化
+     * 上，没有任何东西能把芯片拉回来 —— 现场表现就是"永远停在自检页"，
+     * 只能人跑去断电。提前开了之后，这类卡死 30 秒后自动复位；如果这份固件
+     * 是 OTA 装进来的，复位还会让 boot 的 try 计数累加，最终触发回滚。
+     *
+     * 代价要说清：起不来的固件会变成"每 30 秒重启一次"的循环，
+     * 而不是安静地停住。这是有意的取舍 —— 循环能被看见，也可能自愈。 */
+    app_wdg_start_early();
+
     /* ---------------- init ---------------- */
     r485  = drv_uart_init(UART_RS485, PIN_UART2_BAUD);
     rwifi = drv_uart_init(UART_WIFI,  PIN_UART3_BAUD);
@@ -95,6 +109,8 @@ void app_main(void)
     /* 参数区要在起任务前读：net_task 一启动就要用轮询/上报周期，
      * sample_task 一启动就要用告警阈值，晚一步第一轮数据就按默认值跑了。 */
     app_cfg_init();
+
+    app_wdg_feed();     /* 上面这几步都会读写外部 Flash，耗时不固定 */
 
     /* ---------------- report ---------------- */
     /* 带上编译时间戳：以后上电第一行就能和手头 hex 的时间对一下，
@@ -124,6 +140,16 @@ void app_main(void)
      * 首次开 LSE 晶振要等最多 3 秒，这个等待不能挂在任何任务里。
      * 电池在：一行 [rtc] time ok 后零开销；电池不在：退回编译时刻。 */
     drv_rtc_init();
+    app_wdg_feed();     /* 首次开 LSE 最多要等 3 秒 */
+
+    /* 事件日志必须在 RTC 之后初始化：这条"上电"事件要盖时间戳。
+     * 早于 drv_rtc_init 记的话，drv_rtc_unix 读到的 RTC 是空的，ts 记 0，
+     * 屏上显示成 --:--:--（旧版本补当前时间，会固定显示 08:00，实测踩过）。
+     * 注意 RTC 在但没被 NTP 校准过时，app_event_log 也会把 ts 记 0 ——
+     * 那时 RTC 里是编译时刻，不是真实的上电时间。 */
+    app_event_init();
+    app_event_log(EVT_POWER_ON, 0u);
+    app_wdg_feed();     /* 事件区 64KB 要逐块读一遍 */
 
 #if FLASH_SELFTEST
     flash_selftest();
@@ -147,31 +173,23 @@ void app_main(void)
     lv_port_init();
     printf("[lvgl] port init ok  v%d.%d.%d\r\n",
            LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
+    app_wdg_feed();     /* LVGL 初始化要建一堆对象，堆紧张时会慢 */
 
     /* ---------------- OTA 启动确认 ----------------
      * 跑到这里说明时钟、三个串口、LCD、LVGL、内存池全部初始化成功，
-     * 可以认为这份固件是能用的。如果是"刚装完、待确认"的新固件，
+     * 可以认为这份固件至少"能开机"。如果是刚装完、待确认的新固件，
      * 这里把它标成 DONE，boot 那边就不会再数启动次数了。
      *
-     * 放在调度器启动前：此时各任务还没跑，UART 没人读，
-     * 擦 Flash 那 200~500ms 里丢掉的数据无所谓。
+     * 只写标志，不再顺手搬黄金备份 —— 能开机不等于够可靠，自动搬会把
+     * 上一份真正好用的备份顶掉。固化改由人手动触发（云端 {"golden":1}）。
      * 平时 swap_state 不是 TRYING，这个函数直接返回 0，不碰 Flash。 */
-    {
-        /* TRYING 态先在自检页画一行提示：接下来的十几秒在写黄金备份，
-         * 用户不用对着"卡住的自检页"瞎猜。正常开机零开销零痕迹。 */
-        ota_flag_t peek;
-
-        if (ota_flag_load(&peek) == 0 && peek.swap_state == OTA_SWAP_TRYING) {
-            LCD_ShowString(10, 190, tftlcd_data.width, tftlcd_data.height, 16,
-                           (u8 *)"OTA golden backup ...");
-        }
-    }
     ota_r = app_ota_confirm();
     if (ota_r > 0) {
         printf("[ota] new firmware confirmed, boot_try cleared\r\n");
     } else if (ota_r < 0) {
         printf("[ota] confirm FAILED (flag write error)\r\n");
     }
+    app_wdg_feed();
 
     /* ---------------- hand over to RTOS ---------------- */
     App_freeRTOS_start();

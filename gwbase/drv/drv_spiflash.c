@@ -1,6 +1,6 @@
 /**
  * @file    drv_spiflash.c
- * @brief   EN25Q128 driver over SPI1 (PB3 SCK / PB4 MISO / PB5 MOSI, CS = PB14).
+ * @brief   W25Q128 driver over SPI1 (PB3 SCK / PB4 MISO / PB5 MOSI, CS = PB14).
  *
  * Notes for STM32F4:
  *   PB3/PB4 default to JTDO/NJTRST. Unlike F1 there is no AFIO remap needed:
@@ -139,7 +139,7 @@ int drv_flash_init(void)
 
     id = drv_flash_read_id();
     if (id == 0x000000u || id == 0xFFFFFFu) return -2;   /* bus dead / no power */
-    if ((id >> 16) != FLASH_EXPECTED_MFR)   return -3;   /* not a Winbond/EON NOR */
+    if ((id >> 16) != FLASH_EXPECTED_MFR)   return -3;   /* not a Winbond NOR (expect 0xEF) */
 
     return 0;
 }

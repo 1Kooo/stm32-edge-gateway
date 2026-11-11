@@ -81,7 +81,7 @@ static volatile uint8_t s_ota_pct   = 0; /* 0~100 */
 /* 弹窗用的结果状态：
  * s_ota_done 只在最后一步（CRC 过 + 头写成功 + pending 标志写成功）才置 1，
  * 此刻 300ms 后就复位 —— UI 看到 done=1 就敢写"升级完成"，不存在假成功。
- * s_ota_err 由 net_task 在 app_ota_run 返回非 0 时单点写入（8 个失败出口
+ * s_ota_err 由 net_task 在 app_ota_run 返回非 0 时单点写入（十几个失败出口
  * 逐个加太噪，net_task 那一个 if 是唯一汇聚点）。 */
 static volatile uint8_t  s_ota_done = 0;   /* 1 = 下载+校验+标志全过，马上复位 */
 static volatile int8_t   s_ota_err  = 0;   /* app_ota_run 的失败返回码，0 = 无 */
@@ -92,6 +92,10 @@ static volatile uint32_t s_ota_ver  = 0u;  /* 目标固件版本（握手后从�
 void app_ota_request(void)
 {
     s_req = 1;
+
+    /* 发新请求时把上一次的失败码清掉：否则弹层重开后会先闪一下
+     * 上一次的红字「升级失败」，等 net_task 真正开跑才恢复。 */
+    s_ota_err = 0;
 }
 
 int app_ota_take_request(void)
@@ -278,7 +282,8 @@ int app_ota_run(void)
     }
 
     /* 3. 擦暂存区。头部预留区也要擦，所以从 FW_STAGE_BASE 起算。
-     *    420KB 约 103 个扇区，每扇区 30~100ms，总共 3~10 秒。 */
+     *    扇区数 = (256 + fw_len + 4095) / 4096：560KB 固件约 141 个，
+     *    每扇区 30~100ms，总共 4~14 秒。 */
     sectors = (FW_HDR_RESERVED + hdr.fw_len + FLASH_SECTOR_SIZE - 1u)
               / FLASH_SECTOR_SIZE;
 

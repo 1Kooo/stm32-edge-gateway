@@ -79,4 +79,68 @@ void ota_flag_default(ota_flag_t *f);
  */
 int app_ota_confirm(void);
 
+/**
+ * @brief  把当前 APP 区固件固化成黄金备份（人工确认"这一版可用"）。
+ *
+ * 为什么是手动：自动备份会把"能开机但一操作就死"的固件也存成黄金，
+ * 等真要回滚时回去的还是它。所以固化点由人决定（云端发 {"golden":1}）。
+ *
+ * 顺序是"先作废旧备份 -> 擦写 -> 校验 -> 才回写 len/crc"，
+ * 中途掉电最坏结果是"没有备份"，不会留下指向空壳的假备份。
+ *
+ * 只能由 storage_task 调用（外部 Flash 的唯一写者），且 OTA 不能在跑。
+ *
+ * @return 0 = 成功，-1 = 失败
+ */
+int app_golden_promote(void);
+
+/**
+ * @brief  固化是否正在进行（1 = 正在擦写黄金区）。
+ *
+ * 固化要二十多秒，期间外部 Flash 不能被别的任务读写：一读就会和擦除
+ * 操作交错在 SPI 上；去抢 Flash 互斥量则会阻塞到固化结束，心跳断供，
+ * 看门狗反而把固化打断。所以 net_task / UI 在碰 Flash 前先问一句。
+ */
+uint8_t app_golden_busy(void);
+
+/**
+ * @brief  固化刚结束（3 秒内）：给 UI 补开结果弹层用。
+ *
+ * 固化由云端命令触发，屏上没有按键。而固化一结束 app_golden_busy() 立刻
+ * 变 0，ui_task 往往正是这一刻才抢到 CPU —— 自动开弹层的条件已经失效。
+ * UI 在 busy==0 之后再问一句这个，就能把"固化完成/失败"补显示出来。
+ *
+ * @return 1 = 刚固化完（3 秒内），0 = 没有
+ */
+uint8_t app_golden_just_done(void);
+
+/**
+ * @brief  固化进度，给屏上弹层用。
+ * @return stage: 0=准备 1=擦除 2=搬运 3=校验 4=完成；pct: 0~100
+ */
+uint8_t app_golden_stage(void);
+uint8_t app_golden_pct(void);
+
+/**
+ * @brief  上一次固化的结果：0=没做过/正在做，1=成功，2=失败。
+ *         下次固化开始时清 0。
+ */
+uint8_t app_golden_result(void);
+
+/**
+ * @brief  黄金备份的字节数，0 = 还没有可信备份（关于页显示用）。
+ */
+uint32_t app_golden_len(void);
+
+/**
+ * @brief  算一次当前镜像的 CRC 并缓存（开机调一次，约 0.2 秒）。
+ *         不调的话 app_golden_is_current() 永远返回 0。
+ */
+void app_golden_self_check(void);
+
+/**
+ * @brief  黄金备份是不是当前正在跑的这版：1 = 是，0 = 不是/未算/没备份。
+ */
+uint8_t app_golden_is_current(void);
+
 #endif /* __APP_OTA_FLAG_H */

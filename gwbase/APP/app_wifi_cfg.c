@@ -29,7 +29,9 @@ extern void app_flash_lock(void);
 extern void app_flash_unlock(void);
 
 /* 两个槽各占一个 4KB 扇区，紧挨着放。
- * 0x300000 落在字库预留区（0x100000~0x300000）之后、日志区（0x400000）之前。 */
+ * 0x300000 落在外部 Flash 的"字库预留区"（0x200000~0x400000）里 —— 注意字库
+ * 目前是编译进片内 Flash 的（APP/lv_font_cn_14.c），这 2MB 只是分区表上的占位，
+ * 实际没被写过，所以在这里放凭据不会和任何东西冲突。 */
 #define WIFI_CFG_SLOT_A    0x300000u
 #define WIFI_CFG_SLOT_B    0x301000u
 

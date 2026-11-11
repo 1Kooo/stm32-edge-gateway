@@ -19,7 +19,7 @@
 #include "modbus_rtu.h"
 
 #define MB_GAP_MS       4u      /* 帧内静默超过它就算收完 */
-#define MB_TIMEOUT_MS   200u    /* 从发出到收到第一个字节的上限 */
+#define MB_TIMEOUT_MS   200u    /* 从发出到整帧收完的总时长上限（含首字节等待） */
 #define MB_RX_MAX       64u     /* 一次响应的最大字节数，16 个寄存器 37 字节也够 */
 
 /* CRC16/Modbus：初值 0xFFFF，每字节右移 8 次，移出位为 1 则异或 0xA001。

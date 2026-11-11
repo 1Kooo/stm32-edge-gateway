@@ -3,8 +3,10 @@
  * @brief   USART1 轮询输出（PA9/PA10，115200）。
  *
  * 为什么不搬 APP 的 Public/usart.c：
- * 那份实现依赖 SysTick_Init 做延时和超时，Bootloader 里没有 SysTick 也要能打印。
- * 这里只做「等发送寄存器空 → 写一个字节」，足够了。
+ * 那份实现绑定了 APP 的串口对象和中断/DMA 配置，boot 里没那些东西。
+ * 这里只做「等发送寄存器空 → 写一个字节」，足够打印启动信息。
+ * （SysTick 是有的：main.c 里 HAL_Init 一上来就开了，printf 的阻塞
+ *   也因此不会卡死。）
  */
 
 #include <stdarg.h>

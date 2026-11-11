@@ -1,10 +1,10 @@
 ﻿/**
  * @file    app_ui.c
- * @brief   LVGL 界面：主界面 / WiFi 页 / 切屏手势 / ui_task。
+ * @brief   LVGL 界面：四页（首页 / 设置 / 事件 / 关于）+ 弹层 + ui_task。
  *
- * 从 app_freertos.c 整体搬来，代码原样；只把数据源从直接读
- * app_freertos.c 的私有变量换成四个只读 getter（见 app_ui.h）。
- * 后续配网弹层（屏上输入 WiFi 账号）也加在这个文件里。
+ * 从 app_freertos.c 整体搬来，代码原样；数据源从直接读 app_freertos.c
+ * 的私有变量换成只读 getter（见 app_ui.h）。
+ * 配网弹层、OTA/固化弹层都在这个文件里。
  */
 
 #include <stdio.h>
@@ -18,10 +18,12 @@
 #include "touch.h"           /* 触摸坐标调试显示用：tp_dev */
 #include "net_if.h"          /* net_if_state_str() */
 #include "app_ota.h"         /* app_ota_request() */
+#include "app_ota_flag.h"    /* app_golden_len()：关于页显示黄金备份状态 */
 #include "app_config.h"      /* APP_VERSION / WIFI_SSID / BEMFA_* */
 #include "app_wifi_cfg.h"    /* 配网凭据的存取 */
 #include "drv_rtc.h"         /* drv_rtc_unix / drv_rtc_split：顶栏实时时间 */
 #include "app_wdg.h"         /* app_wdg_kick：ui_task 心跳 */
+#include "app_event.h"       /* 事件页：app_event_recent / 名称表 */
 #include "app_ui.h"
 
 /* 日志函数定义在 app_freertos.c，全项目惯例：用到的文件自己 extern 一句 */
@@ -57,7 +59,11 @@ extern void app_log(const char *fmt, ...);
 static lv_obj_t *s_scr_main;        /* 首页：数据仪表盘 */
 static lv_obj_t *s_scr_wifi;        /* 设置页：网络信息 + 配网入口 */
 static lv_obj_t *s_scr_about;       /* 关于页：版本 / 服务器 / 运行信息 */
-static uint8_t   s_scr_idx = 0;     /* 当前屏：0=首页 1=设置 2=关于 */
+static lv_obj_t *s_scr_evt;         /* 事件页：系统事件列表 */
+static lv_obj_t *s_evt_list;        /* 事件列表容器（自身可滚动） */
+static lv_obj_t *s_evt_label;       /* 整页只这一个 label，行用 \n 分隔 */
+static uint32_t  s_evt_seq;         /* 上次加载时的事件计数，变了才重建 */
+static uint8_t   s_scr_idx = 0;     /* 当前屏：0=首页 1=设置 2=事件 3=关于 */
 
 static lv_obj_t *s_wifi_state;      /* WiFi 页：网络状态 */
 static lv_obj_t *s_wifi_mqtt;       /* WiFi 页：MQTT 状态 */
@@ -76,8 +82,9 @@ static lv_obj_t *s_ui_uptime;       /* 关于页：运行时长 */
 static lv_obj_t *s_ui_datetime;     /* 关于页：RTC 日期时间 */
 static lv_obj_t *s_ui_thr;          /* 关于页：告警阈值 */
 static lv_obj_t *s_ui_store;        /* 关于页：存储写指针 / FULL */
+static lv_obj_t *s_ui_golden;       /* 关于页：备份状态（正常只显示时间，异常才加字） */
 static lv_obj_t *s_ui_heap;         /* 关于页：剩余堆 */
-static lv_obj_t *s_ui_clock;        /* 首页状态条：运行时长 */
+static lv_obj_t *s_ui_clock;        /* 首页状态条：时钟（未对时显示 --:--:--） */
 static lv_obj_t *s_ui_lastpub;      /* 首页：最近一次上报距今秒数 */
 
 /* 触摸坐标调试显示：验证坐标变换对不对时打开，确认后改 0 就完全消失。
@@ -169,7 +176,7 @@ static void ui_build_main(lv_obj_t *scr)
     lv_obj_set_style_bg_color(scr, C_BG, 0);
     lv_obj_set_style_text_color(scr, C_TEXT, 0);
 
-    /* ---- 顶部状态条：左版本，右链路状态 + 运行时长 ---- */
+    /* ---- 顶部状态条：左版本，右链路状态 + 时钟 ---- */
     lb = ui_label(scr, 14, 9, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "GW " APP_VERSION);
 
@@ -194,18 +201,20 @@ static void ui_build_main(lv_obj_t *scr)
     s_ui_temp_bar = lv_bar_create(card);
     lv_obj_set_pos(s_ui_temp_bar, 13, 74);
     lv_obj_set_size(s_ui_temp_bar, 190, 6);
-    lv_bar_set_range(s_ui_temp_bar, -100, 600);          /* -10.0 ~ 60.0 度 */
+    /* 量程对齐"有效性闸门 / 传感器标称"（-40~80℃），不再用早期那个
+     * 没有依据的 -10~60：那样 65℃ 和 70℃ 在条子上都是满格，看不出越限幅度。 */
+    lv_bar_set_range(s_ui_temp_bar, -400, 800);         /* -40.0 ~ 80.0 度 */
     lv_bar_set_value(s_ui_temp_bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_ui_temp_bar, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_ui_temp_bar, OPA_TRACK, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_ui_temp_bar, C_WARN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_ui_temp_bar, C_OK, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s_ui_temp_bar, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(s_ui_temp_bar, 3, LV_PART_INDICATOR);
 
-    /* 量程说明用纯 ASCII + 汉字，别写 °：14px 字库只收了 ASCII 和界面汉字，
-     * 度符号在小字号里没有字形，会变成方块。 */
+    /* 量程说明用 ASCII + 汉字，不写 ° ：字库里其实有 U+00B0，但"-40~80"
+     * 更短、读数更直观，也不占宽度。 */
     lb = ui_label(card, 13, 88, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(lb, "量程 -10~60");
+    lv_label_set_text(lb, "量程 -40~80");
 
     /* ---- 湿度卡 ---- */
     card = ui_card(scr, 250, 32, 216, 112);
@@ -219,7 +228,7 @@ static void ui_build_main(lv_obj_t *scr)
     s_ui_humi_bar = lv_bar_create(card);
     lv_obj_set_pos(s_ui_humi_bar, 13, 74);
     lv_obj_set_size(s_ui_humi_bar, 190, 6);
-    lv_bar_set_range(s_ui_humi_bar, 0, 100);
+    lv_bar_set_range(s_ui_humi_bar, 0, 1000);           /* 0.0 ~ 100.0 %，和阈值同单位 */
     lv_bar_set_value(s_ui_humi_bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(s_ui_humi_bar, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_ui_humi_bar, OPA_TRACK, LV_PART_MAIN);
@@ -349,12 +358,14 @@ static void ui_cfg_ok_cb(lv_event_t *e)
         lv_label_set_text(s_cfg_hint, "SSID 不能为空");
         return;
     }
+    /* 这两处校验的是 strlen 字节数，不是字符数 —— 一个汉字占 3 字节，
+     * 所以中文 SSID 实际只能填 10 个汉字。文案按字节写，免得误会。 */
     if (strlen(ssid) > 32u) {
-        lv_label_set_text(s_cfg_hint, "SSID 最多 32 字");
+        lv_label_set_text(s_cfg_hint, "SSID 最多 32 字节");
         return;
     }
     if (strlen(pass) > 64u) {
-        lv_label_set_text(s_cfg_hint, "密码最多 64 位");
+        lv_label_set_text(s_cfg_hint, "密码最多 64 字节");
         return;
     }
 
@@ -428,7 +439,8 @@ static void ui_scan_pick_cb(lv_event_t *e)
     const char *ssid = lv_event_get_user_data(e);
 
     lv_textarea_set_text(s_cfg_ta_ssid, ssid);
-    /* 填完焦点挪到密码框：SSID 已经有了，下一步自然是打密码 */
+    /* 直接关掉扫描层。焦点不会自动跳到密码框（键盘的 textarea 绑定在
+     * 建层时设为 SSID 框），用户自己点一下密码框即可。 */
     ui_scan_close();
 }
 
@@ -555,6 +567,8 @@ static lv_obj_t *s_ota_hint;        /* 底部提示行 */
 static lv_obj_t *s_ota_stage[5];    /* 节点行：等待/准备/下载/校验/完成 */
 static uint8_t   s_ota_fail_ui;     /* 失败/超时态：置 1 才允许 KEY2 关闭 */
 static uint32_t  s_ota_open_tick;   /* 弹层打开时刻，30 秒等待兜底 */
+static uint8_t   s_ota_ui_mode;     /* 0 = 固件升级，1 = 黄金备份固化 */
+static uint32_t  s_gld_done_tick;   /* 固化结束时刻：留 2.5 秒让人看清结果再关 */
 
 static void ui_ota_close(void)
 {
@@ -574,22 +588,42 @@ static void ui_ota_close(void)
         s_ota_stage[i] = NULL;
     }
     s_ota_fail_ui = 0;
+    s_ota_ui_mode = 0;
 }
 
-static void ui_ota_open(void)
+static void ui_ota_open(uint8_t mode)
 {
     lv_obj_t *panel;
     lv_obj_t *scr;                  /* 挂当前屏：KEY1 任何页都能按 */
     lv_obj_t *lb;
-    const char *names[5] = {"等待", "准备", "下载", "校验", "完成"};
+    /* 两种用途共用这一个弹层，只换标题/节点名/提示语 ——
+     * 另建一套对象的话，LVGL 那 56KB 池子又要被多切一刀。 */
+    const char *names_ota[5] = {"等待", "准备", "下载", "校验", "完成"};
+    const char *names_gld[5] = {"准备", "擦除", "搬运", "校验", "完成"};
+    const char *names[5];
     int i;
 
     if (s_ota_layer != NULL) {
         return;                     /* 已经开着，别重复建 */
     }
 
-    scr = (s_scr_idx == 0u) ? s_scr_main :
-          ((s_scr_idx == 1u) ? s_scr_wifi : s_scr_about);
+    s_ota_ui_mode = mode;
+    for (i = 0; i < 5; i++) {
+        names[i] = (mode != 0u) ? names_gld[i] : names_ota[i];
+    }
+
+    /* 挂当前屏：KEY1 在任何页都能按，所以四页都要映射到。
+     * 这里原来还是三页的写法（非 0 非 1 一律当关于页），加事件页后
+     * 在事件页按 KEY1 会把弹层建到看不见的关于屏上 —— 表现就是"按了没反应"。 */
+    if (s_scr_idx == 0u) {
+        scr = s_scr_main;
+    } else if (s_scr_idx == 1u) {
+        scr = s_scr_wifi;
+    } else if (s_scr_idx == 2u) {
+        scr = s_scr_evt;
+    } else {
+        scr = s_scr_about;
+    }
 
     /* 遮罩：LVGL 9.5 虽然有 backdrop blur 属性，但软件实现要在 layer 缓冲里
      * 先渲染背景（480x320x2 = 300KB），板子 RAM 装不下，所以走"渐变压暗"。
@@ -621,16 +655,16 @@ static void ui_ota_open(void)
     lv_obj_set_style_pad_all(panel, 0, 0);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 柔和阴影：面板四周一圈黑色光晕 + 轻微下投影，视觉上"浮"在暗背景上。
-     * 这是替代真模糊最有效的一招（软件绘制，只在 500ms 刷新时重画，代价可接受）。 */
-    lv_obj_set_style_shadow_color(panel, lv_color_black(), 0);
-    lv_obj_set_style_shadow_width(panel, 28, 0);
-    lv_obj_set_style_shadow_spread(panel, 2, 0);
-    lv_obj_set_style_shadow_opa(panel, 120, 0);
-    lv_obj_set_style_shadow_offset_y(panel, 6, 0);
+    /* 面板阴影：曾经这里是 width=28 + spread + 下投影，视觉上确实"浮"起来了，
+     * 但软件渲染画阴影要先申请一块临时缓冲（lv_draw_sw_box_shadow 的 sh_buf），
+     * 当时的 LVGL 堆（48KB，现已扩到 56KB，见 lv_conf.h）在多页界面下
+     * 已经腾不出这么大一块连续空间 ——
+     * 实测直接 OOM 断言、ui_task 死在弹层创建里，屏就冻住了。
+     * 阴影纯装饰，去掉不影响可读性：渐变遮罩 + 1px 描边 + 16px 圆角已经够分层。 */
+    lv_obj_set_style_shadow_width(panel, 0, 0);
 
     lb = ui_label(panel, 24, 14, FONT_UI, C_TEXT);
-    lv_label_set_text(lb, "固件升级");
+    lv_label_set_text(lb, (mode != 0u) ? "备份固化" : "固件升级");
 
     /* 版本行：放标题右侧。握手拿到固件头之前整行隐藏 ——
      * "版本待定"没有信息量，还占地方。
@@ -665,9 +699,15 @@ static void ui_ota_open(void)
     }
 
     s_ota_hint = ui_label(panel, 24, 164, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(s_ota_hint, "请勿断开电源 完成后自动重启");
+    lv_label_set_text(s_ota_hint,
+                      (mode != 0u) ? "请勿断开电源 只写备份不动固件"
+                                   : "请勿断开电源 完成后自动重启");
 
     s_ota_fail_ui   = 0;
+    /* 计时归零，交给 ui_golden_refresh 按"首次看到结束态"重新计 2.5 秒。
+     * 不清的话，上一次固化留下的旧时刻还在 —— 补开的结果弹层会被关闭条件
+     * 立刻判超时踢掉，观感就是"闪一下 100%"。 */
+    s_gld_done_tick = 0;
     s_ota_open_tick = xTaskGetTickCount();
 }
 
@@ -706,6 +746,53 @@ static const char *ui_ota_fail_text(int8_t code)
     }
 }
 
+/* 备份固化弹层刷新：和 OTA 共用同一个面板，只换数据来源。
+ * 固化结束后留 2.5 秒显示结果再自动关闭 —— 这活是用户主动发的命令，
+ * 不给一个明确的"成了/没成"，人会怀疑到底执行了没有。 */
+static void ui_golden_refresh(void)
+{
+    char    buf[48];
+    uint8_t pct = app_golden_pct();
+
+    if (app_golden_busy() != 0u) {
+        s_gld_done_tick = 0u;
+
+        lv_obj_set_style_text_color(s_ota_state, C_ACCENT, 0);
+        lv_obj_set_style_text_color(s_ota_pct_lb, C_TEXT, 0);
+        lv_bar_set_value(s_ota_bar, pct, LV_ANIM_OFF);
+        sprintf(buf, "%u%%", (unsigned)pct);
+        lv_label_set_text(s_ota_pct_lb, buf);
+
+        switch (app_golden_stage()) {
+        case 0u:  lv_label_set_text(s_ota_state, "准备中");      ui_ota_set_stage(0); break;
+        case 1u:  lv_label_set_text(s_ota_state, "擦除备份区");  ui_ota_set_stage(1); break;
+        case 2u:  lv_label_set_text(s_ota_state, "写入备份");    ui_ota_set_stage(2); break;
+        default:  lv_label_set_text(s_ota_state, "回读校验");    ui_ota_set_stage(3); break;
+        }
+        return;
+    }
+
+    /* 已经结束：第一次进来把结果定住，关闭交给调用方按 s_gld_done_tick 计时 */
+    if (s_gld_done_tick == 0u) {
+        s_gld_done_tick = xTaskGetTickCount();
+
+        if (app_golden_result() == 1u) {
+            lv_label_set_text(s_ota_state, "固化完成");
+            lv_obj_set_style_text_color(s_ota_state, C_OK, 0);
+            lv_bar_set_value(s_ota_bar, 100, LV_ANIM_OFF);
+            lv_label_set_text(s_ota_pct_lb, "100%");
+            ui_ota_set_stage(4);
+            lv_label_set_text(s_ota_hint, "可以继续正常使用");
+        } else {
+            lv_label_set_text(s_ota_state, "固化失败");
+            lv_obj_set_style_text_color(s_ota_state, C_WARN, 0);
+            lv_obj_set_style_bg_color(s_ota_bar, C_WARN, LV_PART_INDICATOR);
+            lv_label_set_text(s_ota_hint, "备份区未写入 串口有原因");
+            ui_ota_set_stage(-1);
+        }
+    }
+}
+
 /* 弹层刷新：ui_task 的 500ms 闸里调一次。只改文字/颜色/进度值，
  * 不建不删对象 —— LVGL 属性刷新是廉价的，建删才是贵的。 */
 static void ui_ota_refresh(void)
@@ -715,6 +802,11 @@ static void ui_ota_refresh(void)
     uint8_t  phase = app_ota_phase();
     uint8_t  pct   = app_ota_pct();
     uint32_t ver   = app_ota_ver();
+
+    if (s_ota_ui_mode != 0u) {
+        ui_golden_refresh();        /* 同一个弹层，数据源不同 */
+        return;
+    }
 
     /* 版本行：握手拿到固件头后才显示 "V0.6 -> V0.7"，之前整行隐藏 */
     if (ver != 0u) {
@@ -860,7 +952,9 @@ static void ui_cfg_open(void)
     lv_obj_center(lb);
     lv_obj_add_event_cb(btn, ui_scan_open_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 第一行：SSID。单行输入，上限 32（和 wifi_cfg_t 的缓冲一致） */
+    /* 第一行：SSID。单行输入。注意 max_length 按"字符"计（中文算 1 个），
+     * 而 wifi_cfg_t 的 ssid 是 33 字节缓冲，所以最终以 ok_cb 里的
+     * strlen 字节校验为准，这里只是防止无限输入。 */
     lb = ui_label(panel, 16, 38, FONT_UI, lv_color_hex(0x777777));
     lv_label_set_text(lb, "SSID");
     ta = lv_textarea_create(panel);
@@ -973,6 +1067,10 @@ static void ui_build_wifi(lv_obj_t *scr)
     lb = ui_label(card, 14, 12, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "SSID");
     s_wifi_ssid = ui_label(card, 86, 12, FONT_UI, C_TEXT);
+    /* 显式给宽度：建的时候文本可能是空串，自适应尺寸会算成 0 宽，
+     * 后面再 set_text 也撑不开（实测出现过"SSID 那一行空白"）。 */
+    lv_obj_set_width(s_wifi_ssid, 340);
+    lv_label_set_long_mode(s_wifi_ssid, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_wifi_ssid, ui_wifi_ssid());
 
     lb = ui_label(card, 14, 40, FONT_UI, C_TEXT_DIM);
@@ -1025,54 +1123,160 @@ static void ui_build_about(lv_obj_t *scr)
     lb = ui_label(scr, 14, 9, FONT_UI, C_TEXT);
     lv_label_set_text(lb, "关于");
 
-    /* 八行 × 26 间距，卡片加高到 218（底部 252，标签栏在 264，留 12px 间隙）。
-     * 行距从 28 收到 26 就是为了塞下「存储」这一行。 */
+    /* 九行 × 23 间距，卡片 218 高（底部 252，标签栏在 264，留 12px 间隙）。
+     * 每加一行就得把行距收一点 —— 这一页信息密度已经很高了。 */
     card = ui_card(scr, 14, 34, 452, 218);
 
-    lb = ui_label(card, 14, 12, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 8, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "版本");
-    lb = ui_label(card, 86, 12, FONT_UI, C_TEXT);
+    lb = ui_label(card, 86, 8, FONT_UI, C_TEXT);
     lv_label_set_text(lb, APP_VERSION);
 
-    lb = ui_label(card, 14, 38, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 31, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "服务器");
-    lb = ui_label(card, 86, 38, FONT_UI, C_TEXT);
+    lb = ui_label(card, 86, 31, FONT_UI, C_TEXT);
     lv_label_set_text(lb, BEMFA_HOST);
 
-    lb = ui_label(card, 14, 64, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 54, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "主题");
-    lb = ui_label(card, 86, 64, FONT_UI, C_TEXT);
+    lb = ui_label(card, 86, 54, FONT_UI, C_TEXT);
     lv_label_set_text(lb, BEMFA_TOPIC);
 
     /* 时间：RTC 真实日期时间 */
-    lb = ui_label(card, 14, 90, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 77, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "时间");
-    s_ui_datetime = ui_label(card, 86, 90, FONT_UI, C_TEXT);
+    s_ui_datetime = ui_label(card, 86, 77, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_datetime, "--");
 
-    lb = ui_label(card, 14, 116, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 100, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "运行");
-    s_ui_uptime = ui_label(card, 86, 116, FONT_UI, C_TEXT);
+    s_ui_uptime = ui_label(card, 86, 100, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_uptime, "00:00:00");
 
-    lb = ui_label(card, 14, 142, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 123, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "内存");
-    s_ui_heap = ui_label(card, 86, 142, FONT_UI, C_TEXT);
+    s_ui_heap = ui_label(card, 86, 123, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_heap, "0 B");
 
     /* 这一行原来是"固件 V1.2 · 中文字库 1084 字形"：版本上面已经有一行了，
      * 纯重复，还要每次改版本手动同步。改成告警阈值，顺手把这个维护点去掉。 */
-    lb = ui_label(card, 14, 168, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 146, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "阈值");
-    s_ui_thr = ui_label(card, 86, 168, FONT_UI, C_TEXT);
-    lv_label_set_text(s_ui_thr, "关");
+    s_ui_thr = ui_label(card, 86, 146, FONT_UI, C_TEXT);
+    lv_label_set_text(s_ui_thr, "--");
 
     /* 存储状态：写指针位置，或"FULL 停记"。没有这一行的话，
      * 日志区写满、停止记录之后，站在机器前面根本看不出来。 */
-    lb = ui_label(card, 14, 194, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 169, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "存储");
-    s_ui_store = ui_label(card, 86, 194, FONT_UI, C_TEXT);
+    s_ui_store = ui_label(card, 86, 169, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_store, "--");
+
+    /* 黄金备份：有了才能回滚。OTA 装完不会自动写，要人工确认这一版可用
+     * 后发 {"golden":1} 才固化 —— 所以这里显示"未固化"是有意义的告警，
+     * 不是没做完。 */
+    lb = ui_label(card, 14, 192, FONT_UI, C_TEXT_DIM);
+    lv_label_set_text(lb, "备份");
+    s_ui_golden = ui_label(card, 86, 192, FONT_UI, C_TEXT);
+    lv_label_set_text(s_ui_golden, "--");
+}
+
+/* ---------------- 第 4 页：系统事件 ----------------
+ * 整个列表只用一个 label 承载（行之间用 \n 分隔），对象数恒定为 1。
+ * 之前是"每行一个 label"，40 个 label 直接把 LVGL 的 56KB 堆打爆，
+ * 触发 lv_obj_allocate_spec_attr 的 OOM 断言，ui_task 死在 ui_create() 里，
+ * 屏幕就永远停在上电自检页 —— 踩过一次，别再退回逐行建对象的写法。 */
+#define EVT_SHOW_MAX   12
+#define EVT_TEXT_MAX   (EVT_SHOW_MAX * 44 + 16)
+
+static void ui_evt_reload(void)
+{
+    evt_t       list[EVT_SHOW_MAX];
+    char        text[EVT_TEXT_MAX];
+    char        arg[24];
+    char        one[64];
+    char        tbuf[10];           /* HH:MM:SS 或 --:--:-- */
+    uint16_t    y;
+    uint8_t     mo, d, h, mi, sec;
+    const char *nm;
+    const char *at;
+    int         n;
+    int         i;
+
+    if (s_evt_list == NULL) return;
+
+    text[0] = '\0';
+
+    n = app_event_recent(list, EVT_SHOW_MAX);
+    if (n <= 0) {
+        if (s_evt_label != NULL) {
+            lv_label_set_text(s_evt_label, "暂无事件");
+        }
+        s_evt_seq = app_event_seq();
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        nm = app_event_name(list[i].code);
+        at = app_event_arg_text(list[i].code, list[i].arg, arg, (int)sizeof(arg));
+
+        /* ts=0 表示这条事件发生的时候时间还不可信（电池丢失，RTC 只是
+         * 编译时刻兜底，或者 LSE 没起振）。这时候显示 --:--:-- 比显示
+         * 一个"看着合法其实假的"时刻更诚实；长度和 HH:MM:SS 一样是 8 个
+         * 字符，整列不会错位。 */
+        if (list[i].ts == 0u) {
+            strcpy(tbuf, "--:--:--");
+        } else {
+            drv_rtc_split(list[i].ts, &y, &mo, &d, &h, &mi, &sec);
+            snprintf(tbuf, sizeof(tbuf), "%02u:%02u:%02u",
+                     (unsigned)h, (unsigned)mi, (unsigned)sec);
+        }
+
+        /* 行首的 ! 标记异常事件 —— 单 label 没法逐行改色，用符号代替 */
+        if (at != NULL) {
+            snprintf(one, sizeof(one), "%s%s  %s  %s\n",
+                     (app_event_is_warn(list[i].code) != 0u) ? "! " : "",
+                     tbuf, nm, at);
+        } else {
+            snprintf(one, sizeof(one), "%s%s  %s\n",
+                     (app_event_is_warn(list[i].code) != 0u) ? "! " : "",
+                     tbuf, nm);
+        }
+        strncat(text, one, sizeof(text) - strlen(text) - 1u);
+    }
+
+    /* label 只建一次，之后只换文本。
+     * 反复 clean + create 会把 LVGL 堆切碎，碎片一多连画圆角的临时缓冲
+     * 都申请不到（circ_calc_aa4 断言 OOM）—— 这是实测踩到的坑。 */
+    if (s_evt_label == NULL) {
+        s_evt_label = lv_label_create(s_evt_list);
+        lv_obj_set_style_text_font(s_evt_label, FONT_UI, 0);
+        lv_obj_set_style_text_color(s_evt_label, C_TEXT, 0);
+    }
+    lv_label_set_text(s_evt_label, text);
+
+    s_evt_seq = app_event_seq();
+}
+
+static void ui_build_evt(lv_obj_t *scr)
+{
+    lv_obj_t *lb;
+
+    lv_obj_set_style_bg_color(scr, C_BG, 0);
+    lv_obj_set_style_text_color(scr, C_TEXT, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lb = ui_label(scr, 14, 9, FONT_UI, C_TEXT);
+    lv_label_set_text(lb, "事件");
+
+    s_evt_list = ui_card(scr, 14, 34, 452, 218);
+    lv_obj_add_flag(s_evt_list, LV_OBJ_FLAG_SCROLLABLE);   /* 卡片当滚动容器 */
+    lv_obj_set_scroll_dir(s_evt_list, LV_DIR_VER);
+    lv_obj_set_style_pad_all(s_evt_list, 8, 0);
+    lv_obj_set_flex_flow(s_evt_list, LV_FLEX_FLOW_COLUMN);
+
+    /* 注意：这里不预先加载列表。开机建 12 行文本虽然比 40 个 label 省，
+     * 但没必要 —— 用户不进这一页就一点不该占。进页时 ui_switch_to 会调 reload。 */
 }
 
 static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连点 */
@@ -1085,7 +1289,7 @@ static void ui_switch_to(uint8_t idx)
 {
     lv_obj_t *target;
 
-    if (idx > 2u || idx == s_scr_idx) {
+    if (idx > 3u || idx == s_scr_idx) {
         return;                                  /* 越界 / 已经在目标页 */
     }
     if ((xTaskGetTickCount() - s_last_sw) < pdMS_TO_TICKS(250)) {
@@ -1093,12 +1297,16 @@ static void ui_switch_to(uint8_t idx)
     }
 
     s_last_sw = xTaskGetTickCount();
+
     s_scr_idx = idx;
 
     if (idx == 0u) {
         target = s_scr_main;
     } else if (idx == 1u) {
         target = s_scr_wifi;
+    } else if (idx == 2u) {
+        target = s_scr_evt;
+        ui_evt_reload();           /* 进页先刷一次，别看到上一次的旧列表 */
     } else {
         target = s_scr_about;
     }
@@ -1122,7 +1330,7 @@ static void ui_gesture_cb(lv_event_t *e)
 
     (void)e;
 
-    if (dir == LV_DIR_LEFT && s_scr_idx < 2u) {
+    if (dir == LV_DIR_LEFT && s_scr_idx < 3u) {
         ui_switch_to((uint8_t)(s_scr_idx + 1u));
     } else if (dir == LV_DIR_RIGHT && s_scr_idx > 0u) {
         ui_switch_to((uint8_t)(s_scr_idx - 1u));
@@ -1133,9 +1341,9 @@ static void ui_gesture_cb(lv_event_t *e)
  * 切屏时整屏换掉，不用维护三份高亮状态的同步。 */
 static void ui_build_tabbar(lv_obj_t *scr, uint8_t cur)
 {
-    static const char *names[3]   = { "首页", "设置", "关于" };
-    static const char *symbols[3] = { LV_SYMBOL_HOME, LV_SYMBOL_SETTINGS,
-                                      LV_SYMBOL_LIST };
+    static const char *names[4]   = { "首页", "设置", "事件", "关于" };
+    static const char *symbols[4] = { LV_SYMBOL_HOME, LV_SYMBOL_SETTINGS,
+                                      LV_SYMBOL_FILE, LV_SYMBOL_LIST };
     lv_obj_t *bar;
     lv_obj_t *btn;
     lv_obj_t *lb;
@@ -1159,11 +1367,11 @@ static void ui_build_tabbar(lv_obj_t *scr, uint8_t cur)
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    for (i = 0; i < 3u; i++) {
+    for (i = 0; i < 4u; i++) {
         c = (i == cur) ? C_ACCENT : lv_color_hex(0x8A99A8);
 
         btn = lv_button_create(bar);
-        lv_obj_set_size(btn, 150, 48);
+        lv_obj_set_size(btn, 112, 48);      /* 480 / 4 个按钮，留点间隙 */
         lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_set_style_shadow_width(btn, 0, 0);
@@ -1183,12 +1391,13 @@ static void ui_build_tabbar(lv_obj_t *scr, uint8_t cur)
     }
 }
 
-/* 建三个屏幕：上电先显示首页 */
+/* 建四个屏幕：上电先显示首页 */
 static void ui_create(void)
 {
     s_scr_main  = lv_obj_create(NULL);
     s_scr_wifi  = lv_obj_create(NULL);
     s_scr_about = lv_obj_create(NULL);
+    s_scr_evt   = lv_obj_create(NULL);
 
     /* 屏幕必须清掉 SCROLLABLE。lv_obj 构造时默认会给所有对象加这个标志，
      * 而手势判定开头就是 "有对象在滚动就直接返回"，屏幕一旦可滚动，
@@ -1196,26 +1405,31 @@ static void ui_create(void)
     lv_obj_clear_flag(s_scr_main,  LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(s_scr_wifi,  LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(s_scr_about, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_scr_evt,   LV_OBJ_FLAG_SCROLLABLE);
 
     ui_build_main(s_scr_main);
     ui_build_wifi(s_scr_wifi);
     ui_build_about(s_scr_about);
+    ui_build_evt(s_scr_evt);
 
     ui_build_tabbar(s_scr_main,  0);
     ui_build_tabbar(s_scr_wifi,  1);
-    ui_build_tabbar(s_scr_about, 2);
+    ui_build_tabbar(s_scr_evt,   2);
+    ui_build_tabbar(s_scr_about, 3);
 
     /* 屏幕本身也要能收手势：手指按在空白处时，命中的对象就是 screen。
-     * 三屏全注册，否则停在某一页时手势会突然失灵。 */
+     * 四屏全注册，否则停在某一页时手势会突然失灵。 */
     lv_obj_add_event_cb(s_scr_main,  ui_gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_event_cb(s_scr_wifi,  ui_gesture_cb, LV_EVENT_GESTURE, NULL);
     lv_obj_add_event_cb(s_scr_about, ui_gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(s_scr_evt,   ui_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     lv_screen_load(s_scr_main);
 }
 
 /* LVGL 每 5ms 处理一次（刷新/触摸/动画）；
- * 数据源变化慢，每 100 次循环（约 500ms）才更新一次文字。 */
+ * 数据源变化慢，按真实时间每 500ms 才更新一次文字（早期用循环计数，首帧
+ * 刷全屏时会被拖成几十秒，已废弃）。 */
 void ui_task(void *args)
 {
     ui_snapshot_t snap;
@@ -1238,7 +1452,8 @@ void ui_task(void *args)
         vTaskDelay(pdMS_TO_TICKS(5));
 
         /* 每 4 次循环（约 20ms）扫一次按键。
-         * KEY2 = 下一页（三页线性，到关于页就不再前进），KEY1 = 请求 OTA。 */
+         * KEY2 = 下一页（四页线性：首页→设置→事件→关于，到关于页回首页），
+         * KEY1 = 请求 OTA。 */
         /* 弹层开着时物理键全部让位：KEY1 会触发 OTA、KEY2 会切屏，
          * 两者都会把弹层晾在半路。关掉弹层再恢复。 */
         /* OTA 弹层独占按键：只有失败/超时态才受理 KEY2 关闭，
@@ -1252,13 +1467,21 @@ void ui_task(void *args)
             if (s_ota_layer != NULL) {
                 if (k == KEY2_PRESS && s_ota_fail_ui) {
                     ui_ota_close();
+                } else if (k == KEY1_PRESS && s_ota_fail_ui) {
+                    /* 失败态下再按 KEY1 直接重试，省掉"先 KEY2 关掉再按 KEY1"。
+                     * 只在失败态放行 —— 下载进行中按 KEY1 一律不理，
+                     * 否则会把正在跑的传输打断。 */
+                    app_log("[ui] KEY1 -> OTA retry\r\n");
+                    ui_ota_close();
+                    app_ota_request();
+                    ui_ota_open(0u);
                 }
             } else if (s_cfg_layer == NULL) {
                 if (k == KEY2_PRESS) {
-                    if (s_scr_idx < 2u) {
+                    if (s_scr_idx < 3u) {
                         ui_switch_to((uint8_t)(s_scr_idx + 1u));
                     } else {
-                        /* 关于页再按一次回到首页：按键是三页循环。
+                        /* 关于页再按一次回到首页：按键是四页循环。
                          * 滑动切页仍是"两头停住"，两套语义并存。 */
                         ui_switch_to(0u);
                     }
@@ -1268,7 +1491,7 @@ void ui_task(void *args)
                      * ui 任务一卡住，屏幕就冻在最后一帧，还会触发看门狗式的假死。 */
                     app_log("[ui] KEY1 -> OTA request\r\n");
                     app_ota_request();
-                    ui_ota_open();
+                    ui_ota_open(0u);
                 }
             }
         }
@@ -1281,7 +1504,7 @@ void ui_task(void *args)
 
             if (sw != 0u && s_cfg_layer == NULL && s_ota_layer == NULL) {
                 if (sw == 1u) {                     /* 手指往左 = 前进一页 */
-                    if (s_scr_idx < 2u) {
+                    if (s_scr_idx < 3u) {
                         ui_switch_to((uint8_t)(s_scr_idx + 1u));
                     }
                 } else {                            /* 手指往右 = 后退一页 */
@@ -1307,9 +1530,39 @@ void ui_task(void *args)
         }
         last_upd = xTaskGetTickCount();
 
-        /* OTA 弹层开着时刷进度：文案/颜色/进度值三样，500ms 一拍 */
+        /* 事件页：停在这一页、且事件计数变了才重建列表。
+         * 12 行的全清重建每 500ms 一次太浪费，所以只在有新事件时做
+         * （早期是逐行 label，那时是 40 行；现在单 label 多行文本，12 行）。 */
+        if (s_scr_idx == 2u && app_event_seq() != s_evt_seq) {
+            ui_evt_reload();
+        }
+
+        /* 进度弹层跟着"正在忙"这个事实自动打开，而不是只靠按下 KEY1 的那一刻：
+         *   - 固化是云端下发的，根本没有按键；
+         *   - OTA 下载失败后重来时，也不一定伴随一次按键
+         *     （实测踩过：重下那次弹层没出来，只有首页「最近上报」在动）。 */
+        if (s_ota_layer == NULL) {
+            if (app_golden_busy() != 0u) {
+                ui_ota_open(1u);
+            } else if (app_golden_just_done() != 0u) {
+                /* 固化太快/UI 被抢，等到这一刻 busy 已经变 0 了。
+                 * 这段时间窗里补开一次，否则"固化成功"根本没人看见。 */
+                ui_ota_open(1u);
+            } else if (app_ota_busy() != 0u) {
+                ui_ota_open(0u);
+            }
+        }
+
+        /* 弹层开着时刷进度：文案/颜色/进度值三样，500ms 一拍 */
         if (s_ota_layer != NULL) {
             ui_ota_refresh();
+        }
+
+        /* 固化弹层显示完结果就自动关；OTA 弹层不在这里关 —— 它要等复位 */
+        if (s_ota_layer != NULL && s_ota_ui_mode == 1u &&
+            s_gld_done_tick != 0u &&
+            (xTaskGetTickCount() - s_gld_done_tick) > pdMS_TO_TICKS(2500)) {
+            ui_ota_close();
         }
 
         /* 原来直接在临界区里拷 s_latest（app_freertos.c 的私有变量），
@@ -1320,7 +1573,7 @@ void ui_task(void *args)
          * 负数不能直接喂 %d.%d：-53 会算成 "-5.-3°"，符号要单独提出来。 */
         if (snap.temp_x10 == -999) {
             lv_label_set_text(s_ui_temp, "--.-°");
-            lv_bar_set_value(s_ui_temp_bar, -100, LV_ANIM_OFF);
+            lv_bar_set_value(s_ui_temp_bar, -400, LV_ANIM_OFF);
         } else {
             t_show     = snap.temp_x10;
             t_show_abs = (t_show < 0) ? (int16_t)(-t_show) : t_show;
@@ -1340,7 +1593,7 @@ void ui_task(void *args)
             sprintf(buf, "%u.%u %%", (unsigned)(snap.humi_x10 / 10u),
                     (unsigned)(snap.humi_x10 % 10u));
             lv_label_set_text(s_ui_humi_pct, buf);
-            lv_bar_set_value(s_ui_humi_bar, snap.humi_x10 / 10u, LV_ANIM_OFF);
+            lv_bar_set_value(s_ui_humi_bar, snap.humi_x10, LV_ANIM_OFF);
         }
 
         /* 告警：越限把大数字染红。判定在 sample_task 里做，UI 只读标志，
@@ -1352,6 +1605,13 @@ void ui_task(void *args)
                     ((f & 1u) != 0u) ? C_WARN : C_TEXT, 0);
             lv_obj_set_style_text_color(s_ui_humi_pct,
                     ((f & 2u) != 0u) ? C_WARN : C_TEXT, 0);
+
+            /* 进度条跟着变色：量程固定表达"在可测范围内的位置"，
+             * 越限靠颜色提示 —— 这样改阈值不会让刻度漂移。 */
+            lv_obj_set_style_bg_color(s_ui_temp_bar,
+                    ((f & 1u) != 0u) ? C_WARN : C_OK, LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(s_ui_humi_bar,
+                    ((f & 2u) != 0u) ? C_WARN : C_OK, LV_PART_INDICATOR);
         }
 
         /* 采样序号 / 已上报 / 待补传：pill 只有数值，单位在标题上 */
@@ -1404,21 +1664,19 @@ void ui_task(void *args)
             lv_label_set_text(s_ui_datetime, "--:--");
         }
 
-        /* 关于页「阈值」：告警关着就写"关"，开着写实际范围。
-         * 阈值来自参数区，云端改完这里立刻跟着变。 */
+        /* 关于页「阈值」：只写"关"的话，恢复出厂后屏幕上就再也看不到
+         * 阈值到底是多少了。所以两者都写 —— 关着时前面挂个"关"字，
+         * 既回答"开没开"，也回答"范围是多少"。 */
         {
             app_param_t pc;
 
             app_param_get(&pc);
-            if (pc.alarm_en == 0u) {
-                lv_label_set_text(s_ui_thr, "关");
-            } else {
-                sprintf(buf, "%d~%d℃ %u~%u%%",
-                        (int)(pc.t_min_x10 / 10), (int)(pc.t_max_x10 / 10),
-                        (unsigned)(pc.h_min_x10 / 10u),
-                        (unsigned)(pc.h_max_x10 / 10u));
-                lv_label_set_text(s_ui_thr, buf);
-            }
+            sprintf(buf, "%s%d~%d℃ %u~%u%%",
+                    (pc.alarm_en == 0u) ? "关 " : "",
+                    (int)(pc.t_min_x10 / 10), (int)(pc.t_max_x10 / 10),
+                    (unsigned)(pc.h_min_x10 / 10u),
+                    (unsigned)(pc.h_max_x10 / 10u));
+            lv_label_set_text(s_ui_thr, buf);
         }
 
         /* 存储：正常显示写指针（看得出在往前走），停记时红字。
@@ -1434,6 +1692,52 @@ void ui_task(void *args)
 
         sprintf(buf, "%u B", (unsigned)xPortGetFreeHeapSize());
         lv_label_set_text(s_ui_heap, buf);
+
+        /* 黄金备份：0 = 还没固化过，此时真出事 boot 只能停机等人，
+         * 所以用警示色标出来。固化过则显示"固化时刻"（不是字节数），
+         * 与当前固件 CRC 不一致时前面加"旧"字并转警示色。
+         * 只在停在关于页、且没有正在固化时才去读 —— 它要读外部 Flash 的
+         * 标志区，固化期间读到的多半是半截数据。 */
+        if (s_scr_idx == 3u && app_golden_busy() == 0u) {
+            uint32_t glen = app_golden_len();
+
+            if (glen == 0u) {
+                lv_label_set_text(s_ui_golden, "未固化");
+                lv_obj_set_style_text_color(s_ui_golden, C_WARN, 0);
+            } else {
+                /* "备份就是当前这版"是常态，不值得占屏幕 —— 正常态只显示
+                 * 固化时刻；只有异常（旧版本 / 取不到时间）才加字并标黄。
+                 * 不显示字节数：那数字既不表示好坏也不表示新旧，
+                 * 核对完整性看串口的 [golden] ok ... bytes 更准。 */
+                uint32_t gts = app_event_last_golden_ts();
+                uint8_t  old = (app_golden_is_current() != 0u) ? 0u : 1u;
+                char     tb[20];
+
+                tb[0] = '\0';
+                if (gts != 0u) {
+                    uint16_t gy;
+                    uint8_t  gmo, gd, gh, gmi, gs;
+
+                    drv_rtc_split(gts, &gy, &gmo, &gd, &gh, &gmi, &gs);
+                    sprintf(tb, "%02u-%02u %02u:%02u",
+                            (unsigned)gmo, (unsigned)gd,
+                            (unsigned)gh, (unsigned)gmi);
+                }
+
+                if (old != 0u) {
+                    /* 加这个功能之前固化的老备份没有事件记录，只剩一个"旧"字 */
+                    if (tb[0] != '\0') sprintf(buf, "旧 %s", tb);
+                    else                sprintf(buf, "旧");
+                } else {
+                    if (tb[0] != '\0') sprintf(buf, "%s", tb);
+                    else                sprintf(buf, "已固化");
+                }
+
+                lv_label_set_text(s_ui_golden, buf);
+                lv_obj_set_style_text_color(s_ui_golden,
+                        (old != 0u) ? C_WARN : C_TEXT, 0);
+            }
+        }
 
         /* OTA 下载优先占这条横幅：下载期间 MQTT 本来就断着，
          * "等待中"停在原地没信息量，进度才是当下最想知道的事。
@@ -1463,8 +1767,8 @@ void ui_task(void *args)
             if (cnt == 0u) {
                 lv_label_set_text(s_ui_lastpub, "等待中");
             } else {
-                /* 文案里别用中点符号：14px 字库只收了 ASCII 和界面汉字，
-                 * 生僻标点没有字形，会显示成方块。空格分隔最稳。 */
+                /* 文案用空格分隔而不是中点：字库里虽然收了 U+00B7，
+                 * 但空格更省心（换字库时不用重新确认标点齐全）。 */
                 sprintf(buf, "%lu 秒前 已确认",
                         (unsigned long)((xTaskGetTickCount() - last_tick)
                                         / configTICK_RATE_HZ));

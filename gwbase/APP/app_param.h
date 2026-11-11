@@ -29,7 +29,9 @@ void app_param_default(app_param_t *p);
 int app_param_load(app_param_t *p);
 
 /* 落盘。会擦掉"另一格"再写，写完回读校验。
- * 只能在 storage_task 里调 —— 外部 Flash 只有它有写权限。 */
+ * 任务上下文里只能在 storage_task 调 —— 外部 Flash 只有它有写权限。
+ * 唯一例外：app_param_load() 发现两格都无效时会就地写一次默认值，
+ * 那是在调度器启动前、单线程跑，不会和其他写者冲突。 */
 int app_param_save(const app_param_t *p);
 
 #endif /* __APP_PARAM_H */
