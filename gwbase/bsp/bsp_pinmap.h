@@ -19,7 +19,7 @@
  *
  * PB0  TP_SCK   PB1 TP_PEN   PB2 TP_MISO   PB3/PB4/PB5 SPI1(Flash)
  * PB8/PB9 I2C(24C02)   PB10/PB11 USART3(WiFi)   PB14 FLASH_CS
- * PB12/PB13/PB15  LCD FSMC（与 SRAM 共用数据线，靠片选区分）
+ * PB12/PB13  未使用        PB15 LCD 背光（当前硬件未接通，见硬件确定稿）
  *
  * PC0  ESP_EN          PC1 ADC_LIGHT   PC2 ADC_TEMP   PC13 TP_CS
  *

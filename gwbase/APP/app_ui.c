@@ -74,6 +74,8 @@ static lv_obj_t *s_ui_sent;         /* 已上报条数 */
 static lv_obj_t *s_ui_backlog;      /* 待补传条数 */
 static lv_obj_t *s_ui_uptime;       /* 关于页：运行时长 */
 static lv_obj_t *s_ui_datetime;     /* 关于页：RTC 日期时间 */
+static lv_obj_t *s_ui_thr;          /* 关于页：告警阈值 */
+static lv_obj_t *s_ui_store;        /* 关于页：存储写指针 / FULL */
 static lv_obj_t *s_ui_heap;         /* 关于页：剩余堆 */
 static lv_obj_t *s_ui_clock;        /* 首页状态条：运行时长 */
 static lv_obj_t *s_ui_lastpub;      /* 首页：最近一次上报距今秒数 */
@@ -1023,42 +1025,54 @@ static void ui_build_about(lv_obj_t *scr)
     lb = ui_label(scr, 14, 9, FONT_UI, C_TEXT);
     lv_label_set_text(lb, "关于");
 
-    card = ui_card(scr, 14, 34, 452, 196);
+    /* 八行 × 26 间距，卡片加高到 218（底部 252，标签栏在 264，留 12px 间隙）。
+     * 行距从 28 收到 26 就是为了塞下「存储」这一行。 */
+    card = ui_card(scr, 14, 34, 452, 218);
 
     lb = ui_label(card, 14, 12, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "版本");
     lb = ui_label(card, 86, 12, FONT_UI, C_TEXT);
     lv_label_set_text(lb, APP_VERSION);
 
-    lb = ui_label(card, 14, 40, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 38, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "服务器");
-    lb = ui_label(card, 86, 40, FONT_UI, C_TEXT);
+    lb = ui_label(card, 86, 38, FONT_UI, C_TEXT);
     lv_label_set_text(lb, BEMFA_HOST);
 
-    lb = ui_label(card, 14, 68, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 64, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "主题");
-    lb = ui_label(card, 86, 68, FONT_UI, C_TEXT);
+    lb = ui_label(card, 86, 64, FONT_UI, C_TEXT);
     lv_label_set_text(lb, BEMFA_TOPIC);
 
-    /* 时间：RTC 真实日期时间。卡片高度 196，六行按 28 间距排，
-     * 「时间」这一行新加，运行/内存/固件三行整体下移。 */
-    lb = ui_label(card, 14, 96, FONT_UI, C_TEXT_DIM);
+    /* 时间：RTC 真实日期时间 */
+    lb = ui_label(card, 14, 90, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "时间");
-    s_ui_datetime = ui_label(card, 86, 96, FONT_UI, C_TEXT);
+    s_ui_datetime = ui_label(card, 86, 90, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_datetime, "--");
 
-    lb = ui_label(card, 14, 124, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 116, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "运行");
-    s_ui_uptime = ui_label(card, 86, 124, FONT_UI, C_TEXT);
+    s_ui_uptime = ui_label(card, 86, 116, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_uptime, "00:00:00");
 
-    lb = ui_label(card, 14, 152, FONT_UI, C_TEXT_DIM);
+    lb = ui_label(card, 14, 142, FONT_UI, C_TEXT_DIM);
     lv_label_set_text(lb, "内存");
-    s_ui_heap = ui_label(card, 86, 152, FONT_UI, C_TEXT);
+    s_ui_heap = ui_label(card, 86, 142, FONT_UI, C_TEXT);
     lv_label_set_text(s_ui_heap, "0 B");
 
-    lb = ui_label(card, 14, 178, FONT_UI, C_TEXT_DIM);
-    lv_label_set_text(lb, "固件 V1.2 · 中文字库 1084 字形");
+    /* 这一行原来是"固件 V1.2 · 中文字库 1084 字形"：版本上面已经有一行了，
+     * 纯重复，还要每次改版本手动同步。改成告警阈值，顺手把这个维护点去掉。 */
+    lb = ui_label(card, 14, 168, FONT_UI, C_TEXT_DIM);
+    lv_label_set_text(lb, "阈值");
+    s_ui_thr = ui_label(card, 86, 168, FONT_UI, C_TEXT);
+    lv_label_set_text(s_ui_thr, "关");
+
+    /* 存储状态：写指针位置，或"FULL 停记"。没有这一行的话，
+     * 日志区写满、停止记录之后，站在机器前面根本看不出来。 */
+    lb = ui_label(card, 14, 194, FONT_UI, C_TEXT_DIM);
+    lv_label_set_text(lb, "存储");
+    s_ui_store = ui_label(card, 86, 194, FONT_UI, C_TEXT);
+    lv_label_set_text(s_ui_store, "--");
 }
 
 static uint32_t s_last_sw = 0;      /* 上次切屏的时刻，用来防连点 */
@@ -1329,6 +1343,17 @@ void ui_task(void *args)
             lv_bar_set_value(s_ui_humi_bar, snap.humi_x10 / 10u, LV_ANIM_OFF);
         }
 
+        /* 告警：越限把大数字染红。判定在 sample_task 里做，UI 只读标志，
+         * 不重复算一遍阈值 —— 两边算法必须只有一个源头。 */
+        {
+            uint8_t f = app_alarm_flags();
+
+            lv_obj_set_style_text_color(s_ui_temp,
+                    ((f & 1u) != 0u) ? C_WARN : C_TEXT, 0);
+            lv_obj_set_style_text_color(s_ui_humi_pct,
+                    ((f & 2u) != 0u) ? C_WARN : C_TEXT, 0);
+        }
+
         /* 采样序号 / 已上报 / 待补传：pill 只有数值，单位在标题上 */
         sprintf(buf, "%lu", (unsigned long)snap.seq);
         lv_label_set_text(s_ui_seq, buf);
@@ -1377,6 +1402,34 @@ void ui_task(void *args)
         } else {
             lv_label_set_text(s_ui_clock, "--:--:--");
             lv_label_set_text(s_ui_datetime, "--:--");
+        }
+
+        /* 关于页「阈值」：告警关着就写"关"，开着写实际范围。
+         * 阈值来自参数区，云端改完这里立刻跟着变。 */
+        {
+            app_param_t pc;
+
+            app_param_get(&pc);
+            if (pc.alarm_en == 0u) {
+                lv_label_set_text(s_ui_thr, "关");
+            } else {
+                sprintf(buf, "%d~%d℃ %u~%u%%",
+                        (int)(pc.t_min_x10 / 10), (int)(pc.t_max_x10 / 10),
+                        (unsigned)(pc.h_min_x10 / 10u),
+                        (unsigned)(pc.h_max_x10 / 10u));
+                lv_label_set_text(s_ui_thr, buf);
+            }
+        }
+
+        /* 存储：正常显示写指针（看得出在往前走），停记时红字。
+         * 「FULL 停记」只在"写满且还有积压"时出现 —— 全发完会自动回绕。 */
+        if (app_store_full() != 0u) {
+            lv_label_set_text(s_ui_store, "FULL 停记");
+            lv_obj_set_style_text_color(s_ui_store, C_WARN, 0);
+        } else {
+            sprintf(buf, "0x%06lX", (unsigned long)app_store_wptr());
+            lv_label_set_text(s_ui_store, buf);
+            lv_obj_set_style_text_color(s_ui_store, C_TEXT, 0);
         }
 
         sprintf(buf, "%u B", (unsigned)xPortGetFreeHeapSize());

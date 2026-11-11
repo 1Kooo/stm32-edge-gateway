@@ -596,6 +596,16 @@
               <FilePath>.\app\app_ota.h</FilePath>
             </File>
             <File>
+              <FileName>app_param.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\app_param.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_param.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\app_param.h</FilePath>
+            </File>
+            <File>
               <FileName>app_ui.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\app\app_ui.c</FilePath>

@@ -33,6 +33,7 @@
 #include "app_ui.h"         /* ui_task 入口 + ui_snapshot_t + 显示数据 getter */
 #include "app_wifi_cfg.h"   /* 屏上配的 WiFi 凭据：待写缓冲 + 落盘 */
 #include "app_wdg.h"        /* 看门狗心跳槽位定义 */
+#include "app_param.h"      /* 掉电保存的运行参数（周期 + 告警阈值） */
 
 /* ================= 断言与内核钩子 ================= */
 void app_assert_failed(const char *file, int line)
@@ -445,6 +446,55 @@ static volatile uint32_t s_pub_period_ms = 2000u;
 #define PUB_PERIOD_MIN_MS    1000u
 #define PUB_PERIOD_MAX_MS    3600000u   /* 上限一小时，防止手滑写成天文数字 */
 #define CMD_PARAM_MAX        64u        /* 云命令文本上限 */
+
+/* 当前生效参数（RAM 副本）。改它、标脏，落盘交给 storage_task。
+ * 上电由 app_cfg_init() 从外部 Flash 读进来。 */
+static app_param_t      s_param;
+static volatile uint8_t s_param_dirty = 0u;
+
+/* 当前告警状态：bit0 = 温度越限，bit1 = 湿度越限。UI 直接读它变色 */
+static volatile uint8_t s_alarm_flags = 0u;
+
+/* 告警事件：只在"状态变化"和"持续提醒"时发一次，不跟每条数据点重复。
+ * ev 的含义：1 = 告警开始，2 = 持续提醒，3 = 已恢复，0 = 无事件。
+ * s_ev_pending 绑在 s_ev_seq 那条记录上，补传时也不会挂错。 */
+static volatile uint8_t  s_ev_pending = 0u;
+static volatile uint32_t s_ev_seq     = 0u;
+static uint8_t           s_alarm_prev = 0u;    /* 上一次判定的告警状态 */
+static uint32_t          s_alarm_last = 0u;    /* 上次发事件提醒的时刻 */
+#define ALARM_REPEAT_MS   (5u * 60u * 1000u)   /* 持续越限时 5 分钟提醒一次 */
+
+/* 远程命令 {"reboot":1} / {"reset":1} 的执行标志：
+ * 不能在 cmd_apply 里直接复位（会把 AT 状态机打断在半路），
+ * 置标志由 net_task 在循环里体面地收尾再重启。 */
+static volatile uint8_t s_reboot_pending = 0u;
+
+/* 上电初始化：读参数区，把值和默认周期对上。
+ * 由 app_main 在 drv_flash_init() 之后、调度器启动之前调用。 */
+void app_cfg_init(void)
+{
+    int r = app_param_load(&s_param);
+
+    s_mb_period_ms  = s_param.mb_ms;
+    s_pub_period_ms = s_param.pub_ms;
+
+    app_log("[param] %s mb=%lu pub=%lu t=%d~%d h=%u~%u alarm=%u\r\n",
+            (r == 0) ? "loaded" : "defaults written",
+            (unsigned long)s_param.mb_ms, (unsigned long)s_param.pub_ms,
+            (int)s_param.t_min_x10, (int)s_param.t_max_x10,
+            (unsigned)s_param.h_min_x10, (unsigned)s_param.h_max_x10,
+            (unsigned)s_param.alarm_en);
+}
+
+uint8_t app_alarm_flags(void)
+{
+    return s_alarm_flags;
+}
+
+void app_param_get(app_param_t *out)
+{
+    if (out != NULL) *out = s_param;
+}
 #define MQTT_CATCHUP_MS      200u       /* 补传节奏：轮与轮之间的间隔 */
 #define MQTT_CATCHUP_GAP_MS  200u       /* 一轮内每条之间的间隔 */
 #define MQTT_CATCHUP_MAX     5u         /* 一轮最多补几条；一轮约 1 秒 */
@@ -505,6 +555,7 @@ static void cmd_apply(const char *s, uint16_t len)
 {
     char    *p;
     uint32_t v;
+    long     lv;
     uint8_t  hit = 0;
     char     buf[CMD_PARAM_MAX];
 
@@ -533,6 +584,7 @@ static void cmd_apply(const char *s, uint16_t len)
             if (v < MB_PERIOD_MIN_MS) v = MB_PERIOD_MIN_MS;
             if (v > MB_PERIOD_MAX_MS) v = MB_PERIOD_MAX_MS;
             s_mb_period_ms = v;
+            s_param.mb_ms  = v;
             hit = 1u;
         }
     }
@@ -545,6 +597,102 @@ static void cmd_apply(const char *s, uint16_t len)
             if (v < PUB_PERIOD_MIN_MS) v = PUB_PERIOD_MIN_MS;
             if (v > PUB_PERIOD_MAX_MS) v = PUB_PERIOD_MAX_MS;
             s_pub_period_ms = v;
+            s_param.pub_ms  = v;
+            hit = 1u;
+        }
+    }
+
+    /* 告警阈值：云端按"整度 / 整百分"发（{"tmax":60}），内部一律用 x10，
+     * 所以进来先乘 10。转发任何一条阈值命令都顺带把告警判定打开 ——
+     * 有人配阈值就说明他要告警，省得再发一条 {"alarm":1}。 */
+    p = strstr(buf, "\"tmin\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            lv = strtol(p + 1, NULL, 10) * 10L;
+            if (lv < MB_TEMP_MIN_X10) lv = MB_TEMP_MIN_X10;
+            if (lv > MB_TEMP_MAX_X10) lv = MB_TEMP_MAX_X10;
+            s_param.t_min_x10 = (int16_t)lv;
+            s_param.alarm_en  = 1u;
+            hit = 1u;
+        }
+    }
+
+    p = strstr(buf, "\"tmax\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            lv = strtol(p + 1, NULL, 10) * 10L;
+            if (lv < MB_TEMP_MIN_X10) lv = MB_TEMP_MIN_X10;
+            if (lv > MB_TEMP_MAX_X10) lv = MB_TEMP_MAX_X10;
+            s_param.t_max_x10 = (int16_t)lv;
+            s_param.alarm_en  = 1u;
+            hit = 1u;
+        }
+    }
+
+    p = strstr(buf, "\"hmin\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            lv = strtol(p + 1, NULL, 10) * 10L;
+            if (lv < 0L) lv = 0L;
+            if (lv > (long)MB_HUMI_MAX_X10) lv = (long)MB_HUMI_MAX_X10;
+            s_param.h_min_x10 = (uint16_t)lv;
+            s_param.alarm_en  = 1u;
+            hit = 1u;
+        }
+    }
+
+    p = strstr(buf, "\"hmax\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            lv = strtol(p + 1, NULL, 10) * 10L;
+            if (lv < 0L) lv = 0L;
+            if (lv > (long)MB_HUMI_MAX_X10) lv = (long)MB_HUMI_MAX_X10;
+            s_param.h_max_x10 = (uint16_t)lv;
+            s_param.alarm_en  = 1u;
+            hit = 1u;
+        }
+    }
+
+    p = strstr(buf, "\"alarm\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL) {
+            s_param.alarm_en = (strtoul(p + 1, NULL, 10) != 0u) ? 1u : 0u;
+            hit = 1u;
+        }
+    }
+
+    /* 远程重启：值必须给 1，{"reboot":0} 当没看见 —— 防手滑把设备踢重启 */
+    p = strstr(buf, "\"reboot\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL && strtoul(p + 1, NULL, 10) == 1u) {
+            s_reboot_pending = 1u;
+            hit = 1u;
+        }
+    }
+
+    /* 恢复出厂：参数回默认 + 立刻落盘 + 重启。
+     * 落盘必须在复位前做完，否则参数区还是旧值，重启后"恢复"等于没做。
+     * 这里借 s_flash_mutex 串行化 —— 擦扇区期间 storage_task 会自动等。 */
+    p = strstr(buf, "\"reset\"");
+    if (p != NULL) {
+        p = strchr(p, ':');
+        if (p != NULL && strtoul(p + 1, NULL, 10) == 1u) {
+            app_param_default(&s_param);
+            s_mb_period_ms   = s_param.mb_ms;
+            s_pub_period_ms  = s_param.pub_ms;
+
+            if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
+            if (app_param_save(&s_param) == 0) s_param_dirty = 0u;
+            else                               s_param_dirty = 1u;
+            if (s_flash_mutex) xSemaphoreGive(s_flash_mutex);
+
+            s_reboot_pending = 1u;      /* 重启让所有任务按默认值重新起步 */
             hit = 1u;
         }
     }
@@ -553,8 +701,21 @@ static void cmd_apply(const char *s, uint16_t len)
         app_log("[cmd] no known key: %s\r\n", buf);   /* 回显原样，方便对格式 */
         return;
     }
-    app_log("[cmd] mb=%lu pub=%lu applied\r\n",
-            (unsigned long)s_mb_period_ms, (unsigned long)s_pub_period_ms);
+
+    if (s_reboot_pending != 0u) {
+        app_log("[cmd] reboot scheduled\r\n");
+    }
+
+    /* 标脏，由 storage_task 落盘。这里绝不碰 Flash：擦扇区要几十毫秒，
+     * 又可能和 OTA 下载抢 SPI 总线。 */
+    s_param_dirty = 1u;
+
+    app_log("[cmd] mb=%lu pub=%lu t=%d~%d h=%u~%u alarm=%u\r\n",
+            (unsigned long)s_param.mb_ms, (unsigned long)s_param.pub_ms,
+            (int)s_param.t_min_x10, (int)s_param.t_max_x10,
+            (unsigned)s_param.h_min_x10, (unsigned)s_param.h_max_x10,
+            (unsigned)s_param.alarm_en);
+
 }
 
 void net_task(void *args)
@@ -568,6 +729,8 @@ void net_task(void *args)
     char          hbuf[12];
     char          cmd[CMD_PARAM_MAX];   /* 云端下行命令文本 */
     uint16_t      cmd_len;
+    uint8_t       alm_now;              /* 本条记录的告警位 */
+    uint8_t       ev_now;               /* 本条记录的事件标记 */
     uint32_t      last_ping;
     uint32_t      backlog;
     uint32_t      budget;
@@ -799,12 +962,32 @@ void net_task(void *args)
                         snprintf(hbuf, sizeof(hbuf), "%u.%u",
                                  (unsigned)(hm / 10u), (unsigned)(hm % 10u));
 
+                        /* 告警位按"当前阈值"重算：记录本身不存告警（16 字节定长
+                         * 结构没有余量），所以补传的老数据也按现在的阈值判。
+                         * 换来的是零格式变更、老机器升级不用改 Flash 格式。 */
+                        {
+                            alm_now = 0u;
+                            if (s_param.alarm_en != 0u) {
+                                if (t < s_param.t_min_x10 || t > s_param.t_max_x10) alm_now |= 1u;
+                                if (hm < s_param.h_min_x10 || hm > s_param.h_max_x10) alm_now |= 2u;
+                            }
+                        }
+
+                        /* 事件只挂在触发它的那条记录上，发完即清。
+                         * 补传时顺序走，也能对上是哪条数据开始报警的。 */
+                        ev_now = 0u;
+                        if (s_ev_pending != 0u && e.seq == s_ev_seq) {
+                            ev_now       = s_ev_pending;
+                            s_ev_pending = 0u;
+                        }
+
                         /* ts = RTC Unix 时间戳：云端按真实时间落库/画曲线，
                          * 断电重启时间线不归零（RTC 降级时是上电秒数） */
                         snprintf(payload, sizeof(payload),
-                                 "{\"ts\":%lu,\"temp\":%s,\"humi\":%s,\"seq\":%lu}",
+                                 "{\"ts\":%lu,\"temp\":%s,\"humi\":%s,\"seq\":%lu,\"alm\":%u,\"ev\":%u}",
                                  (unsigned long)e.ts,
-                                 tbuf, hbuf, (unsigned long)e.seq);
+                                 tbuf, hbuf, (unsigned long)e.seq,
+                                 (unsigned)alm_now, (unsigned)ev_now);
                     }
 
                     if (mqtt_publish(topic, (const uint8_t *)payload,
@@ -848,6 +1031,16 @@ void net_task(void *args)
              * 以前这里只是把字节读出来扔掉，云端发什么都石沉大海。 */
             if (mqtt_pump(cmd, (uint16_t)sizeof(cmd), &cmd_len)) {
                 cmd_apply(cmd, cmd_len);    /* 就在 net_task 里改，不用再转发 */
+            }
+
+            /* 远程重启：先让日志出完、把网络体面收尾，再复位。
+             * 直接 NVIC_SystemReset 会把 AT 状态机和 TCP 连接晾在半路，
+             * ESP 那边还保持着 socket，下次上电要先 CIPCLOSE 兜底。 */
+            if (s_reboot_pending != 0u) {
+                app_log("[cmd] rebooting\r\n");
+                vTaskDelay(pdMS_TO_TICKS(300));
+                net_if_close();
+                NVIC_SystemReset();
             }
 
             if ((HAL_GetTick() - last_ping) >= MQTT_PING_IDLE_MS) {
@@ -897,7 +1090,7 @@ void net_task(void *args)
 
 /* ================= 存储：外部 Flash 日志区（顺序追加，写满即停） ================= */
 #define LOG_BASE        0x00400000u     /* 日志区起点（跳过 OTA 暂存 1MB + 字库 2MB） */
-#define LOG_END         0x00700000u     /* 3MB = 196608 条 */
+#define LOG_END         0x00700000u     /* 3MB = 196608 条；写满且全部已发后回到 LOG_BASE */
 #define LOG_SCAN_CHUNK  512u            /* 扫描块；512 / 16 = 32 条整，不会切断记录 */
 
 static uint32_t s_log_wptr = LOG_BASE;  /* 下一个空位 */
@@ -984,10 +1177,28 @@ static int log_append(const sensor_record_t *rec)
 
     if (s_flash_mutex) xSemaphoreTake(s_flash_mutex, portMAX_DELAY);
 
-    if (s_log_full) { rc = -2; goto out; }
+    if (s_log_full) {
+        /* 写满了。分两种情况：
+         *   1) 一条积压都没有（rptr 追上了 wptr）= 老数据云端全有了，
+         *      整区从头再来，设备可以无限期跑下去；
+         *   2) 还有未发记录 = 老实拒写。绝不能为了继续记录去覆盖没发出去的
+         *      数据 —— 那等于把断网期间的采样永久丢掉，比停记更糟。
+         * 补传把积压清空后，下一次 append 会自己走 1) 恢复。 */
+        if (s_log_wptr == s_log_rptr) {
+            s_log_wptr = LOG_BASE;
+            s_log_rptr = LOG_BASE;
+            s_log_full = 0u;
+            app_log("[store] drained, wrap to base\r\n");
+        } else {
+            rc = -2;
+            goto out;
+        }
+    }
 
-    /* 4KB 一扇区 = 256 条；进入新扇区先擦除。只有顺序追加时这一步才安全：
-     * 回绕覆盖会毁掉别的未发数据，等 7.3 做真环形时再改。 */
+    /* 4KB 一扇区 = 256 条；进入新扇区先擦除。
+     * 只有"顺序追加 + 从头开始时整区已空"两条同时成立才安全：
+     * 上面那块回绕逻辑保证了 wptr 回到 LOG_BASE 时 wptr==rptr 成立，
+     * 所以这里擦的扇区里不可能还有未发数据。 */
     if ((s_log_wptr % FLASH_SECTOR_SIZE) == 0u) {
         if (drv_flash_erase_sector(s_log_wptr) != 0) { rc = -1; goto out; }
     }
@@ -1118,6 +1329,18 @@ void storage_task(void *args)
             continue;
         }
 
+        /* 参数落盘：net_task 只置脏标志，真正擦写在这里做。
+         * 失败也只清标志、不再重试 —— 擦写次数要留给正常使用，
+         * 不能因为一格写不进去就反复擦到把扇区耗光。 */
+        if (s_param_dirty != 0u) {
+            if (app_param_save(&s_param) == 0) {
+                app_log("[param] saved\r\n");
+            } else {
+                app_log("[param] save FAIL (keep in RAM)\r\n");
+            }
+            s_param_dirty = 0u;
+        }
+
         /* 队列空时不能无限期阻塞：心跳会跟着停，20 秒后就被判成停滞。
          * 改成 5 秒超时醒来打一次卡，语义不变（没数据就是没事干）。 */
         if (xQueueReceive(s_data_queue, &rec, pdMS_TO_TICKS(5000)) != pdTRUE) {
@@ -1150,6 +1373,7 @@ void sample_task(void *args)
     uint16_t h_x10;
     uint8_t  has_new;
     uint8_t  ok;
+    uint8_t  ev_kind;
     uint32_t dropped = 0u;
     (void)args;
 
@@ -1188,13 +1412,50 @@ void sample_task(void *args)
             s_latest.temp_x10 = -999;
             s_latest.humi_x10 = 0xFFFFu;
             taskEXIT_CRITICAL();
+            s_alarm_flags = 0u;             /* 读数无效不算告警，也把红字去掉 */
 
             vTaskDelay(pdMS_TO_TICKS(SAMPLE_TASK_PERIOD));
             continue;
         }
 
+        /* 告警判定：拿"业务阈值"判，和上面的有效性闸门（-40~80℃）无关——
+         * 闸门只管读数可不可信，这里管"是否超出用户关心的范围"。
+         * 同时产出"事件"：开始 / 持续提醒 / 恢复，各只发一条，
+         * 否则一直越限会让云端每 2 秒收到一条重复告警。 */
+        ev_kind = 0u;
+        {
+            uint8_t  f   = 0u;
+            uint32_t now = HAL_GetTick();
+
+            if (s_param.alarm_en != 0u) {
+                if (t_x10 < s_param.t_min_x10 || t_x10 > s_param.t_max_x10) f |= 1u;
+                if (h_x10 < s_param.h_min_x10 || h_x10 > s_param.h_max_x10) f |= 2u;
+            }
+
+            if (f != 0u) {
+                if (s_alarm_prev == 0u) {
+                    ev_kind     = 1u;           /* 刚刚越限 */
+                    s_alarm_last = now;
+                } else if ((now - s_alarm_last) >= ALARM_REPEAT_MS) {
+                    ev_kind     = 2u;           /* 一直越限，定期提醒一次 */
+                    s_alarm_last = now;
+                }
+            } else if (s_alarm_prev != 0u) {
+                ev_kind = 3u;                   /* 恢复正常 */
+            }
+
+            s_alarm_prev  = f;
+            s_alarm_flags = f;
+        }
+
         /* 序号接着 Flash 里的最大号往下排，重启后不会从 0 重来 */
         rec.seq      = ++s_last_seq;
+
+        /* 事件挂到触发它的这条记录上：补传时也知道是哪条数据报的警 */
+        if (ev_kind != 0u) {
+            s_ev_pending = ev_kind;
+            s_ev_seq     = rec.seq;
+        }
         rec.ts       = drv_rtc_unix();   /* RTC 真实时间；降级时等于上电秒数 */
         rec.temp_x10 = t_x10;
         rec.humi_x10 = h_x10;
@@ -1247,6 +1508,18 @@ uint32_t app_net_pub_cnt(void)
 uint32_t app_store_log_pending(void)
 {
     return log_pending();
+}
+
+/* 存储状态给关于页显示。wptr 是 4 字节对齐变量，单次读取不会撕；
+ * full 是 0/1 标志，最多晚一个采样周期看到，够用了。 */
+uint32_t app_store_wptr(void)
+{
+    return s_log_wptr;
+}
+
+uint8_t app_store_full(void)
+{
+    return s_log_full;
 }
 
 /* ================= WiFi 扫描：UI 侧接口 =================

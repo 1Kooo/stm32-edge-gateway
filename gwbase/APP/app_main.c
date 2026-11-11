@@ -77,6 +77,8 @@ static void flash_selftest(void)
 
 void app_main(void)
 {
+    /* 参数区加载 + 周期/阈值就位（实现在 app_freertos.c） */
+    extern void app_cfg_init(void);
     int      r485, rwifi;
     int      rf;
     int      ota_r;
@@ -89,6 +91,10 @@ void app_main(void)
      * 不能塞进 flash_selftest() 里，那个自检默认关闭时会一起被编掉，
      * 表现就是 [store] write FAIL。 */
     rf = drv_flash_init();
+
+    /* 参数区要在起任务前读：net_task 一启动就要用轮询/上报周期，
+     * sample_task 一启动就要用告警阈值，晚一步第一轮数据就按默认值跑了。 */
+    app_cfg_init();
 
     /* ---------------- report ---------------- */
     /* 带上编译时间戳：以后上电第一行就能和手头 hex 的时间对一下，

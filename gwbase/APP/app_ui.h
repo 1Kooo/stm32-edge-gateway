@@ -12,6 +12,8 @@
 
 #include <stdint.h>
 
+#include "app_param.h"      /* 告警阈值显示要读 app_param_t */
+
 /* 唯一碰 LCD 的任务入口，App_freeRTOS_start() 里 xTaskCreate 用。
  * 其他任务只写内存，避免总线竞争。 */
 void ui_task(void *args);
@@ -30,6 +32,17 @@ void     app_data_get_snapshot(ui_snapshot_t *out);
 uint8_t  app_net_mqtt_up(void);          /* 1 = MQTT 在线 */
 uint32_t app_net_pub_cnt(void);          /* 累计已上报条数 */
 uint32_t app_store_log_pending(void);    /* 待补传积压条数 */
+
+/* 存储区状态：写指针位置 + 是否已停止记录（写满且有积压） */
+uint32_t app_store_wptr(void);
+uint8_t  app_store_full(void);
+
+/* 告警状态：bit0 = 温度越限，bit1 = 湿度越限，0 = 正常。
+ * 由 sample_task 每轮判定，UI 只读不算。 */
+uint8_t  app_alarm_flags(void);
+
+/* 取当前生效参数（范围与告警开关），关于页显示阈值用 */
+void     app_param_get(app_param_t *out);
 
 /* WiFi 扫描（UI 发起请求，net_task 执行 —— 串口只有一个主人，
  * 透传进出的活别的任务碰会撞车）。状态轮询 + 一次拷贝，全程不阻塞 UI：
